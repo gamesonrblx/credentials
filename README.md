@@ -24,4 +24,34 @@ Credentials is a standalone API and gateway from day one. It is not embedded in 
 
 ## Status
 
-Concept stage. No code yet.
+Pre-alpha. The encryption design is [docs/ENCRYPTION.md](docs/ENCRYPTION.md). The Rust workspace implements the envelope, a dev key provider, and a small gateway. It is not a production secrets service.
+
+The dev root-key provider stores raw keys in a local file so the process can run without a cloud KMS. It refuses to start when `CREDENTIALS_ENV=production`. Do not point it at real secrets you cannot afford to lose, and do not commit the key file.
+
+## Crates
+
+| Crate | Role |
+| --- | --- |
+| `credentials-crypto` | AES-256-GCM envelope encryption, KEK wrapping, the `RootKeyProvider` trait, the dev provider, and X-Wing key transport. |
+| `credentials-gateway` | Axum server: short-lived tokens, scope checks, decrypt-and-inject, hash-chained audit log. |
+| `credentials-client` | Small HTTP client, including DPoP proofs for inject calls. This pre-alpha build speaks plain HTTP to a loopback gateway. |
+
+Crypto uses reviewed crates: RustCrypto `aes-gcm` for AES-256-GCM, RustCrypto `x-wing` for X25519 + ML-KEM-768, and `ed25519-dalek` for token and DPoP signatures. The gateway is Tokio and Axum.
+
+## Build and test
+
+```bash
+cargo test --workspace
+```
+
+The dev server listens on `127.0.0.1:8080`:
+
+```bash
+cargo run -p credentials-gateway
+```
+
+`CREDENTIALS_LISTEN` changes the address. `CREDENTIALS_DEV_KEYS` changes the dev key file (default `.credentials-dev-keys.json`). Workspace creation on this listener is unauthenticated so a local process can bootstrap. Keep it on loopback.
+
+## What is still stubbed
+
+Cloud KMS and HSM adapters, TLS with the hybrid `X25519MLKEM768` group, the end-to-end mode, external backends (Infisical, 1Password, Doppler), a durable database, and human login. The binary's upstream client is unconfigured, so proxy injection from `cargo run` returns an upstream error. Tests supply a recording upstream.
