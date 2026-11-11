@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+.credentials-dev-keys.json
+.credentials-dev-keys.tmp
+*.pem
+.env
+.env.*
