@@ -84,15 +84,28 @@ pub struct DevPolicy {
 }
 
 impl DevPolicy {
-    pub fn from_env_value(value: Option<&str>) -> Self {
-        Self {
-            allow_dev: value != Some("production"),
+    /// An unset variable means development. `production` or `prod` selects
+    /// the control plane. `development`, `dev`, and `test` select dev. Case
+    /// and surrounding whitespace are ignored. Any other value, including an
+    /// empty one, is an error, so a typo cannot start a dev gateway.
+    pub fn from_env_value(value: Option<&str>) -> Result<Self, CryptoError> {
+        let Some(raw) = value else {
+            return Ok(Self { allow_dev: true });
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "production" | "prod" => Ok(Self { allow_dev: false }),
+            "development" | "dev" | "test" => Ok(Self { allow_dev: true }),
+            _ => Err(CryptoError::UnknownEnvironment),
         }
     }
 
-    pub fn from_env() -> Self {
-        let value = std::env::var("CREDENTIALS_ENV").ok();
-        Self::from_env_value(value.as_deref())
+    /// Reads `CREDENTIALS_ENV`. A value that is not valid Unicode is an error.
+    pub fn from_env() -> Result<Self, CryptoError> {
+        match std::env::var("CREDENTIALS_ENV") {
+            Ok(value) => Self::from_env_value(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Self::from_env_value(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(CryptoError::UnknownEnvironment),
+        }
     }
 
     fn check(self) -> Result<(), CryptoError> {
@@ -492,8 +505,7 @@ fn open_under_root(
     let nonce = &blob[4..16];
     let ciphertext = &blob[16..];
     let aad = context_aad(context);
-    let plain = open(root, nonce, ciphertext, &aad)?;
-    Ok(Zeroizing::new(plain))
+    open(root, nonce, ciphertext, &aad)
 }
 
 fn context_aad(context: &KekContext) -> Vec<u8> {
@@ -619,11 +631,28 @@ mod tests {
 
     #[test]
     fn production_policy_refuses_dev_providers() {
-        let denied = DevPolicy::from_env_value(Some("production"));
+        let denied = DevPolicy::from_env_value(Some("production")).unwrap();
         assert!(MemoryRootKeys::new(denied).is_err());
         let dir = std::env::temp_dir().join(format!("credentials-dev-refuse-{}", Uuid::now_v7()));
         let path = dir.join("keys.json");
         assert!(DevFileRootKeys::open(&path, denied).is_err());
+    }
+
+    #[test]
+    fn environment_value_fails_closed_on_anything_unrecognised() {
+        for value in ["production", "Production", " PROD\n", "prod"] {
+            assert!(!DevPolicy::from_env_value(Some(value)).unwrap().allow_dev);
+        }
+        for value in ["development", "dev", "Test"] {
+            assert!(DevPolicy::from_env_value(Some(value)).unwrap().allow_dev);
+        }
+        assert!(DevPolicy::from_env_value(None).unwrap().allow_dev);
+        for value in ["", "  ", "producton", "staging", "live", "production1"] {
+            assert!(matches!(
+                DevPolicy::from_env_value(Some(value)),
+                Err(CryptoError::UnknownEnvironment)
+            ));
+        }
     }
 
     #[test]

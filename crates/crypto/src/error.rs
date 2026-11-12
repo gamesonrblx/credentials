@@ -16,6 +16,8 @@ pub enum CryptoError {
     KeyLength,
     #[error("a dev root-key provider cannot run when CREDENTIALS_ENV=production")]
     DevProviderInProduction,
+    #[error("CREDENTIALS_ENV must be production, prod, development, dev, or test")]
+    UnknownEnvironment,
     #[error("the tenant root key is not available")]
     RootKeyUnavailable,
     #[error("the dev key file could not be read or written")]
