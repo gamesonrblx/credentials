@@ -290,6 +290,71 @@ impl Gateway {
         })
     }
 
+    /// A new integer version. The previous ciphertext stays in the store.
+    pub async fn create_version(
+        &self,
+        credential: &str,
+        name: &str,
+        value: &[u8],
+    ) -> Result<CreatedVersion, ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        self.ensure_active(&workspace)?;
+        if !valid_secret_name(name) {
+            return Err(ApiError::BadRequest);
+        }
+        if value.is_empty() || value.len() > DEFAULT_MAX_SECRET_BYTES {
+            return Err(ApiError::PayloadTooLarge);
+        }
+        let secret = self.store.secret_by_name(workspace.id, name).await?;
+        let latest = self.store.latest_version(secret.id).await?;
+        let version_n = latest.version.checked_add(1).ok_or(ApiError::BadRequest)?;
+        let kek_row = self.store.active_kek(workspace.id).await?;
+        let kek = self.unwrap_kek(&workspace, &kek_row)?;
+        let version_id = Uuid::now_v7();
+        let sealed = seal_secret(
+            &kek,
+            kek_row.id,
+            kek_row.version,
+            VersionIds {
+                workspace_id: workspace.id,
+                secret_id: secret.id,
+                version_id,
+            },
+            value,
+            DEFAULT_MAX_SECRET_BYTES,
+        )
+        .map_err(map_crypto)?;
+        self.store
+            .insert_version(
+                VersionRow {
+                    id: version_id,
+                    secret_id: secret.id,
+                    workspace_id: workspace.id,
+                    version: version_n,
+                    sealed,
+                    kek_id: kek_row.id,
+                    wrap_mode: WrapMode::Gateway,
+                    e2e_encapsulation: None,
+                },
+                self.audit(
+                    workspace.id,
+                    None,
+                    "secret.write",
+                    vec![
+                        ("secret_id".into(), AuditValue::Uuid(secret.id)),
+                        ("version_id".into(), AuditValue::Uuid(version_id)),
+                        ("secret_name".into(), AuditValue::String(name.to_owned())),
+                    ],
+                ),
+            )
+            .await?;
+        Ok(CreatedVersion {
+            secret_id: secret.id,
+            version_id,
+            version: version_n,
+        })
+    }
+
     pub async fn create_agent(
         &self,
         credential: &str,

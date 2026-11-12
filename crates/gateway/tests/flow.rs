@@ -5,7 +5,7 @@ use std::sync::Arc;
 use credentials_crypto::{CountingProvider, DevPolicy, MemoryRootKeys};
 use credentials_gateway::{
     generate_dpop, verify_chain, Delivery, DeliveryPolicy, Gateway, InjectRequest, ManualClock,
-    MemoryStore, Now, RecordingUpstream,
+    MemoryStore, Now, RecordingUpstream, Store,
 };
 
 struct Env {
@@ -127,6 +127,79 @@ async fn proxy_inject_happy_path_writes_the_audit_chain() {
         .any(|event| event.event_type == "secret.access.delivered"));
     let full = env.gateway.audit_log(&env.credential, None).await.unwrap();
     assert!(verify_chain(&full));
+}
+
+#[tokio::test]
+async fn a_new_version_does_not_replace_the_previous_ciphertext() {
+    let env = setup().await;
+    let first = env
+        .gateway
+        .create_secret(
+            &env.credential,
+            "prod/openai/api_key",
+            b"version-one",
+            policy(),
+        )
+        .await
+        .unwrap();
+    let second = env
+        .gateway
+        .create_version(&env.credential, "prod/openai/api_key", b"version-two")
+        .await
+        .unwrap();
+    assert_eq!(second.secret_id, first.secret_id);
+    assert_eq!(second.version, 2);
+    let latest = Store::latest_version(env.store.as_ref(), first.secret_id)
+        .await
+        .unwrap();
+    let rows = Store::versions_for_kek(env.store.as_ref(), latest.kek_id)
+        .await
+        .unwrap();
+    let mut ours: Vec<_> = rows
+        .into_iter()
+        .filter(|row| row.secret_id == first.secret_id)
+        .collect();
+    ours.sort_by_key(|row| row.version);
+    assert_eq!(ours.len(), 2);
+    assert_ne!(
+        ours[0].sealed.payload_ciphertext,
+        ours[1].sealed.payload_ciphertext
+    );
+    let dpop = generate_dpop().unwrap();
+    let agent = env
+        .gateway
+        .create_agent(&env.credential, "runner")
+        .await
+        .unwrap();
+    let session = env
+        .gateway
+        .create_session(
+            &env.credential,
+            agent,
+            vec!["secret:inject:prod/openai/api_key".into()],
+            Some(60),
+            dpop.public_b64(),
+        )
+        .await
+        .unwrap();
+    let htu = "https://credentials.local/v1/inject";
+    let proof = dpop.proof(
+        "POST",
+        htu,
+        &session.token,
+        env.clock.unix_secs(),
+        "proof-v2",
+    );
+    let response = env
+        .gateway
+        .inject(request(&session.token, &proof, htu))
+        .await
+        .unwrap();
+    assert_eq!(response.body, b"upstream-ok");
+    assert_eq!(
+        env.upstream.last_value().as_deref(),
+        Some("Bearer version-two")
+    );
 }
 
 #[tokio::test]

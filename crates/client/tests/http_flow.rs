@@ -28,6 +28,11 @@ async fn http_inject_round_trip() {
         .create_secret("prod/openai/api_key", b"sk-http", &["api.openai.com"])
         .await
         .unwrap();
+    let second = client
+        .create_version("prod/openai/api_key", b"sk-http-v2")
+        .await
+        .unwrap();
+    assert_eq!(second.version, 2);
     let agent = client.create_agent("http-runner").await.unwrap();
     let dpop = DpopKey::generate();
     let session = client

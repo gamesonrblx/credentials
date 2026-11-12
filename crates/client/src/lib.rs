@@ -114,6 +114,21 @@ impl CredentialsClient {
         .await
     }
 
+    pub async fn create_version(
+        &self,
+        name: &str,
+        value: &[u8],
+    ) -> Result<VersionCreated, ClientError> {
+        let body = serde_json::json!({ "value": STANDARD.encode(value) });
+        self.send(
+            self.http
+                .post(format!("{}/v1/secrets/{name}/versions", self.base))
+                .json(&body),
+            self.auth(),
+        )
+        .await
+    }
+
     pub async fn create_agent(&self, display_name: &str) -> Result<AgentCreated, ClientError> {
         let body = serde_json::json!({ "display_name": display_name });
         self.send(

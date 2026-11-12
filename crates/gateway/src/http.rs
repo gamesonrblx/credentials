@@ -26,6 +26,7 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route("/healthz", get(health))
         .route("/v1/workspaces", post(create_workspace))
         .route("/v1/secrets", post(create_secret))
+        .route("/v1/secrets/{*tail}", post(create_version))
         .route("/v1/agents", post(create_agent))
         .route("/v1/agent-sessions", post(create_session))
         .route("/v1/agent-sessions/{id}/revoke", post(revoke_session))
@@ -112,6 +113,33 @@ async fn create_secret(
                 allow_env: body.policy.allow_env,
             },
         )
+        .await?;
+    Ok(Json(VersionResponse {
+        secret_id: created.secret_id,
+        version_id: created.version_id,
+        version: created.version,
+    }))
+}
+
+#[derive(Deserialize)]
+struct VersionBody {
+    value: String,
+}
+
+async fn create_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(tail): axum::extract::Path<String>,
+    Json(body): Json<VersionBody>,
+) -> Result<Json<VersionResponse>, ApiError> {
+    let name = tail
+        .strip_suffix("/versions")
+        .filter(|name| !name.is_empty() && !name.ends_with('/'))
+        .ok_or(ApiError::NotFound)?;
+    let value = b64std_decode(&body.value)?;
+    let created = state
+        .gateway
+        .create_version(bearer(&headers)?, name, &value)
         .await?;
     Ok(Json(VersionResponse {
         secret_id: created.secret_id,
