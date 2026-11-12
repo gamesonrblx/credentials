@@ -39,10 +39,11 @@ pub use http::{router, router_local, router_tls, router_with_bootstrap, router_w
 pub use local::{peer_uid_allowed, serve_local};
 pub use login::LoginHub;
 pub use policy::{Delivery, DeliveryPolicy};
-pub use redact::redact_field;
+pub use redact::{redact_field, redacting_fields};
 pub use service::{
-    generate_dpop, Clock, CreatedSession, E2eSubmission, Gateway, InjectRequest, InjectResponse,
-    ManualClock, Now, ISSUER,
+    generate_dpop, AuditPage, Clock, CreatedSession, E2eSubmission, Gateway, InjectRequest,
+    InjectResponse, ManualClock, Now, AUDIT_PAGE_DEFAULT, AUDIT_PAGE_MAX, DELETION_RETENTION_SECS,
+    GRANT_TTL_SECS, ISSUER,
 };
 pub use sql_store::SqlStore;
 pub use store::{MemoryStore, RecipientRow, Store, WrapMode};
@@ -50,8 +51,10 @@ pub use tls::{
     group_code, hybrid_provider, is_hybrid, serve_tls, server_config, tls_classical_kex_total,
     HYBRID_GROUP,
 };
-pub use token::DevSigner;
-pub use upstream::{HttpUpstream, Outbound, RecordingUpstream, UnconfiguredUpstream, Upstream};
+pub use token::{grant_message, DevSigner, GRANT_PREFIX};
+pub use upstream::{
+    HttpUpstream, Inbound, Outbound, RecordingUpstream, UnconfiguredUpstream, Upstream,
+};
 
 use std::net::SocketAddr;
 use std::sync::Arc;

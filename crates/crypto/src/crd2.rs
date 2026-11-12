@@ -100,7 +100,7 @@ pub fn open_e2e(
     if plaintext.len() != sealed.plaintext_len {
         return Err(CryptoError::Decrypt);
     }
-    Ok(Zeroizing::new(plaintext))
+    Ok(plaintext)
 }
 
 #[cfg(test)]

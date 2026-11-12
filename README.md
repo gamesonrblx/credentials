@@ -34,7 +34,9 @@
 
 Credentials gives an agent a short session. The session can call an allow-listed host. The session does not receive the secret in the model prompt.
 
-The dev process can read plaintext. That process stops when `CREDENTIALS_ENV=production`. The production control plane stores ciphertext. It does not open an end-to-end secret. The customer injector holds the decapsulation key.
+The dev process can read plaintext. That process stops when `CREDENTIALS_ENV=production`. The production control plane stores ciphertext. It does not open an end-to-end secret. The customer injector holds the decapsulation key. The control plane signs a grant for each release. The injector checks that grant before it opens the secret.
+
+`CREDENTIALS_ENV` accepts `production`, `prod`, `development`, `dev`, and `test`. The process exits on any other value.
 
 This repository is pre-alpha. It does not claim a production SLA.
 
@@ -52,6 +54,7 @@ This repository is pre-alpha. It does not claim a production SLA.
 
 - Install Rust 1.89 or a later stable release.
 - Use Cargo from that toolchain.
+- On Windows, install the Visual Studio C++ build tools, CMake, and NASM. Keep the checkout path short, or set `CARGO_TARGET_DIR` to a short path.
 
 ### Installation
 
@@ -75,7 +78,7 @@ The dev gateway listens on `127.0.0.1:8080`. Keep that port on the local machine
 
 Create a workspace on the loopback listener. Mint a short agent session. Call `POST /v1/inject` with the agent token and a DPoP proof.
 
-Use `proxy` on the public listener. The gateway calls the allow-listed `https` host. The secret is not in the response.
+Use `proxy` on the public listener. The gateway calls the allow-listed `https` host. It accepts `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, and `DELETE`. It does not return a response that contains the secret. An allow-listed host that returns the secret in another encoding can still leak it. Allow-list only hosts that you trust.
 
 Use `env` or `header` only on the local socket. Set `CREDENTIALS_LOCAL_DIR`. The directory mode is `0700`.
 

@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Customer-run injector. Holds the workspace decapsulation key and opens CRD2 grants."
+description = "Customer-run injector. Holds the workspace decapsulation key, verifies signed grants, and delivers under their policy."
 
 [[bin]]
 name = "credentials-injector"
@@ -15,5 +15,14 @@ path = "src/main.rs"
 [dependencies]
 base64 = "0.23.1"
 credentials-crypto = { path = "../crypto" }
+ed25519-dalek = "3.0.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 serde_json = "1.0.154"
+sha2 = "0.11.0"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
+url = "2.5.8"
 uuid = { version = "1.26.1", features = ["v7"] }
+zeroize = { version = "1.9.1", features = ["alloc"] }
+
+[dev-dependencies]
+credentials-gateway = { path = "../gateway" }

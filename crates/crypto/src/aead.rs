@@ -1,7 +1,8 @@
 //! AES-256-GCM via the RustCrypto `aes-gcm` crate.
 //!
 //! The ciphertext is the seal output, which is ciphertext followed by the
-//! 16-byte tag. The nonce is stored beside it.
+//! 16-byte tag. The nonce is stored beside it. `open` returns a buffer that is
+//! wiped on drop, so an early return cannot leave key bytes or plaintext behind.
 
 use aes_gcm::{
     aead::{
@@ -11,6 +12,8 @@ use aes_gcm::{
     },
     Aes256Gcm,
 };
+
+use zeroize::Zeroizing;
 
 use crate::CryptoError;
 
@@ -38,7 +41,7 @@ pub(crate) fn open(
     nonce: &[u8],
     ciphertext: &[u8],
     aad: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let nonce: &[u8; 12] = nonce.try_into().map_err(|_| CryptoError::Decrypt)?;
     let cipher = Aes256Gcm::new(&Array::<u8, U32>::from(*key));
     let nonce = Array::<u8, U12>::from(*nonce);
@@ -50,5 +53,6 @@ pub(crate) fn open(
                 aad,
             },
         )
+        .map(Zeroizing::new)
         .map_err(|_| CryptoError::Decrypt)
 }

@@ -1,30 +1,85 @@
-# Local self-host example. The database password is for this example only.
+# Local self-host example of the production control plane.
+#
+# Before `docker compose up`, supply:
+#
+#   CREDENTIALS_OPERATOR_TOKEN  at least 16 random characters, for example
+#                               `openssl rand -hex 32`. Required to create
+#                               workspaces. There is no default.
+#   CREDENTIALS_DB_PASSWORD     password for the bundled Postgres.
+#   CREDENTIALS_PUBLIC_URL      the https origin clients use, with no path.
+#                               DPoP proofs are bound to it. Defaults to
+#                               https://localhost:8443 for a local trial.
+#   ./certs/fullchain.pem       TLS certificate chain, leaf first.
+#   ./certs/key.pem             its private key as PKCS#8 ("BEGIN PRIVATE
+#                               KEY") or SEC1 ("BEGIN EC PRIVATE KEY"). RSA
+#                               PKCS#1 keys are not read. Both files must be
+#                               readable by uid 10001. For a local trial:
+#     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+#       -keyout certs/key.pem -out certs/fullchain.pem -days 30 \
+#       -subj /CN=localhost -addext subjectAltName=DNS:localhost
+#
+# Put the variables in a `.env` file next to this one or export them.
+#
+# Production mode requires TLS and, by default, the hybrid post-quantum group
+# X25519MLKEM768 only. Clients without it (curl on OpenSSL 3.0, older
+# browsers) cannot connect; set TLS_REQUIRE_HYBRID=0 to also offer classical
+# groups.
+#
 # The gateway container has no decapsulation key. The injector is a second
-# service with its own volume. Postgres is reached without TLS because this
-# client build does not speak Postgres TLS. Do not publish that port.
+# service with its own volume. The signing key and audit anchor are created
+# in the gateway-data volume on first start; back that volume up.
+#
+# Postgres here runs without TLS, so the gateway is told to accept a
+# plaintext database URL. The database sits on an internal network with no
+# published port. For a database on another host, use sslmode=verify-full
+# and remove CREDENTIALS_ALLOW_PLAINTEXT_DB.
 
 services:
   db:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: credentials
-      POSTGRES_PASSWORD: credentials
+      POSTGRES_PASSWORD: ${CREDENTIALS_DB_PASSWORD:?set CREDENTIALS_DB_PASSWORD}
       POSTGRES_DB: credentials
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U credentials -d credentials"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   gateway:
     build: .
     environment:
       CREDENTIALS_ENV: production
-      CREDENTIALS_DATABASE_URL: postgres://credentials:credentials@db:5432/credentials?sslmode=disable
+      CREDENTIALS_LISTEN: 0.0.0.0:8443
+      CREDENTIALS_PUBLIC_URL: ${CREDENTIALS_PUBLIC_URL:-https://localhost:8443}
+      CREDENTIALS_OPERATOR_TOKEN: ${CREDENTIALS_OPERATOR_TOKEN:?set CREDENTIALS_OPERATOR_TOKEN to at least 16 random characters}
+      CREDENTIALS_DATABASE_URL: postgres://credentials:${CREDENTIALS_DB_PASSWORD:?set CREDENTIALS_DB_PASSWORD}@db:5432/credentials?sslmode=disable
+      CREDENTIALS_ALLOW_PLAINTEXT_DB: "1"
       CREDENTIALS_SIGNING_KEY: /var/credentials/signing.json
       CREDENTIALS_AUDIT_ANCHOR: /var/credentials/anchor.log
-      CREDENTIALS_OPERATOR_TOKEN: change-me
-      CREDENTIALS_LISTEN: 0.0.0.0:8080
+      CREDENTIALS_TLS_CERT: /etc/credentials/tls/fullchain.pem
+      CREDENTIALS_TLS_KEY: /etc/credentials/tls/key.pem
     volumes:
       - gateway-data:/var/credentials
+      - ./certs:/etc/credentials/tls:ro
     ports:
-      - "8080:8080"
+      - "8443:8443"
+    networks: [backend, frontend]
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+    # TCP-level check only: the image has no HTTP client, and a hybrid-only
+    # TLS listener would refuse a classical one anyway.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8443"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
   injector:
     build: .
     entrypoint: ["credentials-injector"]
@@ -32,6 +87,12 @@ services:
       - injector-keys:/var/injector
     profiles: ["injector"]
 
+networks:
+  backend:
+    internal: true
+  frontend: {}
+
 volumes:
+  db-data:
   gateway-data:
   injector-keys:

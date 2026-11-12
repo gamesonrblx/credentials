@@ -31,7 +31,53 @@ async fn listen(require_hybrid: bool) -> (std::net::SocketAddr, CertificateDer<'
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
         certified.signing_key.serialize_der(),
     ));
-    let config = server_config(cert.clone(), key, require_hybrid).unwrap();
+    let config = server_config(vec![cert.clone()], key, require_hybrid).unwrap();
+    (spawn_one(config).await, cert)
+}
+
+#[tokio::test]
+async fn intermediate_certificates_are_sent() {
+    fn ca(name: &str) -> rcgen::CertificateParams {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params
+    }
+    let root =
+        rcgen::CertifiedIssuer::self_signed(ca("test root"), rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+    let intermediate = rcgen::CertifiedIssuer::signed_by(
+        ca("test intermediate"),
+        rcgen::KeyPair::generate().unwrap(),
+        &*root,
+    )
+    .unwrap();
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let leaf = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .unwrap()
+        .signed_by(&leaf_key, &*intermediate)
+        .unwrap();
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+    let chain = vec![leaf.der().clone(), intermediate.der().clone()];
+    let config = server_config(chain, key, true).unwrap();
+    let addr = spawn_one(config).await;
+    // The client trusts only the root, so it needs the intermediate from the server.
+    let group = handshake(addr, root.der(), true).await;
+    assert!(is_hybrid(group));
+}
+
+#[test]
+fn an_empty_chain_is_refused() {
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        certified.signing_key.serialize_der(),
+    ));
+    assert!(server_config(Vec::new(), key, true).is_err());
+}
+
+async fn spawn_one(config: rustls::ServerConfig) -> std::net::SocketAddr {
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -48,7 +94,7 @@ async fn listen(require_hybrid: bool) -> (std::net::SocketAddr, CertificateDer<'
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
             .await;
     });
-    (addr, cert)
+    addr
 }
 
 async fn handshake(

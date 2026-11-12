@@ -129,6 +129,7 @@ async fn production_releases_e2e_and_refuses_to_seal_plaintext() {
             htm: "POST".into(),
             htu: "https://credentials.local/v1/inject".into(),
             local_channel: false,
+            content_type: None,
         })
         .await
         .unwrap();
@@ -213,6 +214,7 @@ async fn control_plane_does_not_open_a_dev_sealed_secret() {
             htm: "POST".into(),
             htu: "https://credentials.local/v1/inject".into(),
             local_channel: false,
+            content_type: None,
         })
         .await;
     assert!(released.is_err());

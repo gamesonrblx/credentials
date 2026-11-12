@@ -63,6 +63,7 @@ fn request(token: &str, proof: &str, htu: &str) -> InjectRequest {
         htm: "POST".into(),
         htu: htu.into(),
         local_channel: false,
+        content_type: None,
     }
 }
 

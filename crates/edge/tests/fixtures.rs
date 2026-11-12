@@ -63,10 +63,20 @@ fn infisical_doppler_and_onepassword_match_public_shapes() {
     let base = format!("http://{addr}");
     let infisical = read_infisical(&base, "token", "ws", "prod").unwrap();
     assert_eq!(infisical[0].name, "OPENAI_API_KEY");
-    assert_eq!(infisical[0].value, "sk-infisical");
+    assert_eq!(infisical[0].value.as_str(), "sk-infisical");
+    assert!(!format!("{infisical:?}").contains("sk-infisical"));
     let doppler = read_doppler(&base, "token", "proj", "prd").unwrap();
-    assert_eq!(doppler[0].value, "sk-doppler");
+    assert_eq!(doppler[0].value.as_str(), "sk-doppler");
     let one = read_onepassword(&base, "token", "vault-1").unwrap();
     assert_eq!(one[0].name, "OpenAI");
-    assert_eq!(one[0].value, "sk-onepassword");
+    assert_eq!(one[0].value.as_str(), "sk-onepassword");
+}
+
+#[test]
+fn importers_refuse_plain_http_to_a_remote_host() {
+    let error = read_infisical("http://secrets.example", "token", "ws", "prod").unwrap_err();
+    assert!(error.contains("https"));
+    assert!(!error.contains("token"));
+    assert!(read_doppler("http://10.1.2.3", "token", "p", "c").is_err());
+    assert!(read_onepassword("ftp://127.0.0.1", "token", "v").is_err());
 }

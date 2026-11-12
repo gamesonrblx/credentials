@@ -4,9 +4,10 @@
 //! without a live database. Postgres placeholders are `$1` style. SQLite uses
 //! `?`. Migrations live in `migrations/{sqlite,postgres}` and run on connect.
 //!
-//! This build links Postgres without a TLS stack. A URL that omits `sslmode`
-//! is pinned to `disable`. A deployment that needs TLS to the database has to
-//! add that dependency on purpose.
+//! Postgres links rustls with the aws-lc-rs provider. The URL is passed to
+//! sqlx unchanged: an explicit `sslmode` is honoured and a missing one takes
+//! the sqlx default (`prefer`). [`SqlStore::postgres_url_enforces_tls`] tells
+//! production startup whether the URL refuses a plaintext connection.
 
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -63,12 +64,14 @@ macro_rules! on_tx {
 macro_rules! workspace_from {
     ($row:expr) => {{
         let hash: Option<Vec<u8>> = $row.try_get("credential_hash").map_err(map_db)?;
+        let delete_after: Option<i64> = $row.try_get("delete_after").map_err(map_db)?;
         Ok(WorkspaceRow {
             id: $row.try_get("id").map_err(map_db)?,
             status: $row.try_get("status").map_err(map_db)?,
             kms_key_ref: $row.try_get("kms_key_ref").map_err(map_db)?,
             credential_hash: hash.map(arr32).transpose()?.unwrap_or([0u8; 32]),
             audit_seq: u64_from($row.try_get("audit_seq").map_err(map_db)?)?,
+            delete_after: delete_after.map(u64_from).transpose()?,
         })
     }};
 }
@@ -196,15 +199,8 @@ fn is_postgres(url: &str) -> bool {
     url.starts_with("postgres://") || url.starts_with("postgresql://")
 }
 
-fn normalize_pg(url: &str) -> String {
-    if url.contains("sslmode=") {
-        url.to_owned()
-    } else if url.contains('?') {
-        format!("{url}&sslmode=disable")
-    } else {
-        format!("{url}?sslmode=disable")
-    }
-}
+/// The `sslmode` values that refuse a plaintext connection.
+const TLS_SSLMODES: &[&str] = &["require", "verify-ca", "verify-full"];
 
 fn map_db(err: sqlx::Error) -> ApiError {
     if let Some(db) = err.as_database_error() {
@@ -267,10 +263,9 @@ pub struct SqlStore {
 impl SqlStore {
     pub async fn connect(url: &str) -> Result<Self, ApiError> {
         let pool = if is_postgres(url) {
-            let url = normalize_pg(url);
             let pool = PgPoolOptions::new()
                 .max_connections(8)
-                .connect(&url)
+                .connect(url)
                 .await
                 .map_err(map_db)?;
             sqlx::migrate!("./migrations/postgres")
@@ -300,6 +295,27 @@ impl SqlStore {
             return Err(ApiError::StoreUnavailable);
         };
         Ok(Self { pool })
+    }
+
+    /// True when a Postgres URL sets `sslmode` to `require`, `verify-ca` or
+    /// `verify-full`. A missing `sslmode`, a weaker one, or a repeated key
+    /// with any weaker value is false. Production refuses such a URL.
+    pub fn postgres_url_enforces_tls(url: &str) -> bool {
+        if !is_postgres(url) {
+            return false;
+        }
+        let Ok(parsed) = url::Url::parse(url) else {
+            return false;
+        };
+        let modes: Vec<String> = parsed
+            .query_pairs()
+            .filter(|(key, _)| key == "sslmode")
+            .map(|(_, value)| value.into_owned())
+            .collect();
+        !modes.is_empty()
+            && modes
+                .iter()
+                .all(|mode| TLS_SSLMODES.contains(&mode.as_str()))
     }
 
     pub fn engine_name(&self) -> &'static str {
@@ -359,7 +375,7 @@ impl Store for SqlStore {
 
     async fn workspace_by_hash(&self, hash: &[u8; 32]) -> Result<WorkspaceRow, ApiError> {
         let sql =
-            "SELECT w.id, w.status, w.kms_key_ref, w.audit_seq, c.secret_hash AS credential_hash \
+            "SELECT w.id, w.status, w.kms_key_ref, w.audit_seq, w.delete_after, c.secret_hash AS credential_hash \
                    FROM workspace_credentials c \
                    JOIN workspaces w ON w.id = c.workspace_id \
                    WHERE c.secret_hash = ? AND c.revoked_at IS NULL";
@@ -377,7 +393,7 @@ impl Store for SqlStore {
     }
 
     async fn workspace(&self, id: Uuid) -> Result<WorkspaceRow, ApiError> {
-        let sql = "SELECT w.id, w.status, w.kms_key_ref, w.audit_seq, \
+        let sql = "SELECT w.id, w.status, w.kms_key_ref, w.audit_seq, w.delete_after, \
                    (SELECT c.secret_hash FROM workspace_credentials c \
                     WHERE c.workspace_id = w.id AND c.revoked_at IS NULL \
                     ORDER BY c.created_at LIMIT 1) AS credential_hash \
@@ -414,6 +430,89 @@ impl Store for SqlStore {
         } else {
             Ok(())
         }
+    }
+
+    async fn schedule_workspace_deletion(
+        &self,
+        id: Uuid,
+        delete_after: u64,
+    ) -> Result<(), ApiError> {
+        let deadline = i64_from(delete_after)?;
+        let changed = on_pool!(
+            self,
+            "UPDATE workspaces SET status = 'deleting', delete_after = ? WHERE id = ? AND status = 'active'",
+            |db, q| {
+                sqlx::query(q)
+                    .bind(deadline)
+                    .bind(id)
+                    .execute(db)
+                    .await
+                    .map_err(map_db)?
+                    .rows_affected()
+            }
+        );
+        if changed == 0 {
+            Err(ApiError::WorkspaceDeleting)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn cancel_workspace_deletion(&self, id: Uuid) -> Result<(), ApiError> {
+        let changed = on_pool!(
+            self,
+            "UPDATE workspaces SET status = 'active', delete_after = NULL WHERE id = ? AND status = 'deleting'",
+            |db, q| {
+                sqlx::query(q)
+                    .bind(id)
+                    .execute(db)
+                    .await
+                    .map_err(map_db)?
+                    .rows_affected()
+            }
+        );
+        if changed == 0 {
+            Err(ApiError::BadRequest)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn rotate_workspace_credential(
+        &self,
+        workspace_id: Uuid,
+        old_hash: &[u8; 32],
+        new_hash: [u8; 32],
+        at: u64,
+        audit: AuditDraft,
+    ) -> Result<(), ApiError> {
+        let stamped = i64_from(at)?;
+        let mut tx = self.begin().await?;
+        append_tx(&mut tx, audit).await?;
+        let changed = on_tx!(&mut tx, "UPDATE workspace_credentials SET revoked_at = ? WHERE workspace_id = ? AND secret_hash = ? AND revoked_at IS NULL", |db, q| {
+            sqlx::query(q)
+                .bind(stamped)
+                .bind(workspace_id)
+                .bind(old_hash.as_slice())
+                .execute(&mut **db)
+                .await
+                .map_err(map_db)?
+                .rows_affected()
+        });
+        if changed != 1 {
+            return Err(ApiError::Unauthenticated);
+        }
+        on_tx!(&mut tx, "INSERT INTO workspace_credentials (id, workspace_id, secret_hash, created_at) VALUES (?, ?, ?, ?)", |db, q| {
+            sqlx::query(q)
+                .bind(Uuid::now_v7())
+                .bind(workspace_id)
+                .bind(new_hash.as_slice())
+                .bind(now_nanos())
+                .execute(&mut **db)
+                .await
+                .map_err(map_db)?;
+        });
+        commit(tx).await
     }
 
     async fn insert_kek(&self, kek: KekRow) -> Result<(), ApiError> {
@@ -818,6 +917,75 @@ impl Store for SqlStore {
         )
     }
 
+    async fn audit_page(
+        &self,
+        workspace_id: Uuid,
+        agent_id: Option<Uuid>,
+        after_seq: u64,
+        limit: u32,
+    ) -> Result<Vec<AuditRecord>, ApiError> {
+        let after = i64_from(after_seq)?;
+        let limit = i64::from(limit);
+        match agent_id {
+            Some(agent) => on_pool!(
+                self,
+                &format!("{AUDIT_COLS} WHERE workspace_id = ? AND agent_id = ? AND seq > ? ORDER BY seq LIMIT ?"),
+                |db, q| {
+                    let rows = sqlx::query(q)
+                        .bind(workspace_id)
+                        .bind(agent)
+                        .bind(after)
+                        .bind(limit)
+                        .fetch_all(db)
+                        .await
+                        .map_err(map_db)?;
+                    rows.iter().map(|row| audit_from!(row)).collect()
+                }
+            ),
+            None => on_pool!(
+                self,
+                &format!("{AUDIT_COLS} WHERE workspace_id = ? AND seq > ? ORDER BY seq LIMIT ?"),
+                |db, q| {
+                    let rows = sqlx::query(q)
+                        .bind(workspace_id)
+                        .bind(after)
+                        .bind(limit)
+                        .fetch_all(db)
+                        .await
+                        .map_err(map_db)?;
+                    rows.iter().map(|row| audit_from!(row)).collect()
+                }
+            ),
+        }
+    }
+
+    async fn audit_event(
+        &self,
+        workspace_id: Uuid,
+        seq: u64,
+    ) -> Result<Option<AuditRecord>, ApiError> {
+        let seq = i64_from(seq)?;
+        on_pool!(
+            self,
+            &format!("{AUDIT_COLS} WHERE workspace_id = ? AND seq = ?"),
+            |db, q| {
+                let row = sqlx::query(q)
+                    .bind(workspace_id)
+                    .bind(seq)
+                    .fetch_optional(db)
+                    .await
+                    .map_err(map_db)?;
+                match row {
+                    Some(row) => {
+                        let record: Result<AuditRecord, ApiError> = audit_from!(&row);
+                        record.map(Some)
+                    }
+                    None => Ok(None),
+                }
+            }
+        )
+    }
+
     async fn revoke_workspace_sessions(&self, workspace_id: Uuid, at: u64) -> Result<(), ApiError> {
         on_pool!(
             self,
@@ -885,7 +1053,7 @@ impl Store for SqlStore {
     }
 
     async fn workspaces_with_status(&self, status: &str) -> Result<Vec<WorkspaceRow>, ApiError> {
-        let sql = "SELECT w.id, w.status, w.kms_key_ref, w.audit_seq, \
+        let sql = "SELECT w.id, w.status, w.kms_key_ref, w.audit_seq, w.delete_after, \
                    (SELECT c.secret_hash FROM workspace_credentials c \
                     WHERE c.workspace_id = w.id AND c.revoked_at IS NULL \
                     ORDER BY c.created_at LIMIT 1) AS credential_hash \
@@ -1477,3 +1645,36 @@ async fn append_tx(tx: &mut SqlTx<'_>, draft: AuditDraft) -> Result<AuditRecord,
 }
 
 // row mappers follow the pool macros so both engines type-check the same fields
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_require_and_verify_modes_enforce_tls() {
+        let enforce = SqlStore::postgres_url_enforces_tls;
+        assert!(enforce("postgres://u@db/app?sslmode=require"));
+        assert!(enforce("postgresql://u@db/app?sslmode=verify-ca"));
+        assert!(enforce(
+            "postgres://u@db/app?application_name=g&sslmode=verify-full"
+        ));
+        assert!(!enforce("postgres://u@db/app"));
+        assert!(!enforce("postgres://u@db/app?sslmode=prefer"));
+        assert!(!enforce("postgres://u@db/app?sslmode=disable"));
+        assert!(!enforce("postgres://u@db/app?sslmode=allow"));
+        assert!(!enforce("postgres://u@db/app?sslmode=REQUIRE"));
+        assert!(!enforce(
+            "postgres://u@db/app?sslmode=require&sslmode=disable"
+        ));
+        assert!(!enforce("sqlite://dev.sqlite?sslmode=require"));
+        assert!(!enforce("not a url"));
+    }
+
+    #[test]
+    fn placeholders_are_numbered_for_postgres() {
+        assert_eq!(
+            pg_placeholders("SELECT a FROM t WHERE x = ? AND y = ?"),
+            "SELECT a FROM t WHERE x = $1 AND y = $2"
+        );
+    }
+}

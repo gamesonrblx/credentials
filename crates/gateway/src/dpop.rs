@@ -128,6 +128,21 @@ pub fn verify_dpop(
     })
 }
 
+/// True when `x_b64` is the canonical unpadded base64url encoding of a 32-byte
+/// Ed25519 public key that decodes to a curve point of full order.
+pub fn valid_public_key(x_b64: &str) -> bool {
+    let Ok(bytes) = b64url_decode(x_b64) else {
+        return false;
+    };
+    let Ok(raw) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+        return false;
+    };
+    if b64url_encode(&raw) != x_b64 {
+        return false;
+    }
+    VerifyingKey::from_bytes(&raw).is_ok_and(|key| !key.is_weak())
+}
+
 pub fn thumbprint(x_b64: &str) -> String {
     let canonical = format!(r#"{{"crv":"Ed25519","kty":"OKP","x":"{x_b64}"}}"#);
     let digest = Sha256::digest(canonical.as_bytes());
@@ -164,6 +179,20 @@ mod tests {
     fn thumbprint_vector() {
         let x = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         assert_eq!(thumbprint(x), "ogRZbCR5KTrPFCAfuYmCMwj0w7Yuk3Lr6YWQWfpkbf0");
+    }
+
+    #[test]
+    fn public_key_must_be_a_canonical_ed25519_point() {
+        let key = DpopKey::generate().unwrap();
+        assert!(valid_public_key(key.public_b64()));
+        assert!(!valid_public_key(""));
+        assert!(!valid_public_key("not base64!"));
+        assert!(!valid_public_key(&b64url_encode(&[7u8; 31])));
+        assert!(!valid_public_key(&format!(" {}", key.public_b64())));
+        // The identity point has small order.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        assert!(!valid_public_key(&b64url_encode(&identity)));
     }
 
     #[test]

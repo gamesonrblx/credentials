@@ -79,7 +79,7 @@ fn vault_transit_and_kv_round_trip() {
     write_kv(&endpoint);
     let rows = read_vault_kv(&endpoint, "root", "secret", "imports").expect("kv");
     assert_eq!(rows[0].name, "OPENAI_API_KEY");
-    assert_eq!(rows[0].value, "sk-vault");
+    assert_eq!(rows[0].value.as_str(), "sk-vault");
 }
 
 #[test]

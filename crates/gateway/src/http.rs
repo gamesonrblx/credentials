@@ -62,14 +62,19 @@ pub fn router_with_login(
     })
 }
 
-/// Public routes behind the TLS listener. DPoP `htu` uses `https`.
-pub fn router_tls(gateway: Arc<Gateway>, operator_token: Option<String>) -> Router {
+/// Public routes behind the TLS listener. DPoP `htu` uses `https`. Pass
+/// `login` to serve the OIDC dashboard login on this listener.
+pub fn router_tls(
+    gateway: Arc<Gateway>,
+    operator_token: Option<String>,
+    login: Option<SharedLogin>,
+) -> Router {
     routes().with_state(AppState {
         gateway,
         operator_token,
         local_channel: false,
         tls: true,
-        login: None,
+        login,
     })
 }
 
@@ -87,7 +92,12 @@ pub fn router_local(gateway: Arc<Gateway>) -> Router {
 fn routes() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(health))
+        .route("/v1/keys", get(signing_keys))
         .route("/v1/workspaces", post(create_workspace))
+        .route(
+            "/v1/workspaces/{id}/credential/rotate",
+            post(rotate_credential),
+        )
         .route("/v1/secrets", post(create_secret))
         .route("/v1/secrets/{*tail}", post(secret_action))
         .route("/v1/agents", post(create_agent))
@@ -122,6 +132,49 @@ fn routes() -> Router<AppState> {
 
 async fn health() -> StatusCode {
     StatusCode::OK
+}
+
+#[derive(Serialize)]
+struct KeysResponse {
+    keys: Vec<KeyItem>,
+}
+
+#[derive(Serialize)]
+struct KeyItem {
+    kid: String,
+    alg: &'static str,
+    public_key: String,
+}
+
+/// Unauthenticated. The injector operator pins this key to verify grants.
+async fn signing_keys(State(state): State<AppState>) -> Json<KeysResponse> {
+    let (kid, public_key) = state.gateway.signing_key();
+    Json(KeysResponse {
+        keys: vec![KeyItem {
+            kid: kid.to_owned(),
+            alg: "EdDSA",
+            public_key: b64std_encode(&public_key),
+        }],
+    })
+}
+
+async fn rotate_credential(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<WorkspaceResponse>, ApiError> {
+    let credential = bearer(&headers)?;
+    if state.gateway.workspace_id_for(credential).await? != id {
+        return Err(ApiError::NotFound);
+    }
+    let fresh = state
+        .gateway
+        .rotate_workspace_credential(credential)
+        .await?;
+    Ok(Json(WorkspaceResponse {
+        id,
+        credential: fresh,
+    }))
 }
 
 #[derive(Serialize)]
@@ -359,6 +412,10 @@ struct InjectBody {
     secret: String,
     delivery: String,
     request: Option<ProxyRequest>,
+    /// Content-Type of the proxied body. `request.content_type` is accepted
+    /// too; when both are present they must match.
+    #[serde(default)]
+    content_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -367,6 +424,8 @@ struct ProxyRequest {
     url: String,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    content_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -391,8 +450,13 @@ async fn inject(
         method: "GET".into(),
         url: String::new(),
         body: String::new(),
+        content_type: None,
     });
-    let htu = request_htu(&headers, state.tls)?;
+    let content_type = match (body.content_type, request.content_type) {
+        (Some(outer), Some(inner)) if outer != inner => return Err(ApiError::BadRequest),
+        (outer, inner) => inner.or(outer).filter(|value| !value.is_empty()),
+    };
+    let htu = request_htu(&headers, state.tls, state.gateway.public_origin())?;
     let response = state
         .gateway
         .inject(InjectRequest {
@@ -410,6 +474,7 @@ async fn inject(
             htm: "POST".into(),
             htu,
             local_channel: state.local_channel,
+            content_type,
         })
         .await?;
     Ok(Json(InjectHttpResponse {
@@ -421,12 +486,19 @@ async fn inject(
 #[derive(Deserialize)]
 struct AuditQuery {
     agent_id: Option<Uuid>,
+    /// Return events with `seq` greater than this. Default 0.
+    #[serde(default)]
+    after_seq: u64,
+    /// Page size. Default 500, capped at 1000.
+    limit: Option<u32>,
 }
 
 #[derive(Serialize)]
 struct AuditResponse {
     events: Vec<AuditEventResponse>,
     checkpoint: Option<AuditCheckpointResponse>,
+    /// Pass as `after_seq` for the next page. Null on the last page.
+    next_after_seq: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -452,9 +524,14 @@ async fn audit(
 ) -> Result<Json<AuditResponse>, ApiError> {
     let credential = bearer(&headers)?;
     let checkpoint = state.gateway.latest_checkpoint(credential).await?;
-    let events = state.gateway.audit_log(credential, query.agent_id).await?;
+    let page = state
+        .gateway
+        .audit_page(credential, query.agent_id, query.after_seq, query.limit)
+        .await?;
     Ok(Json(AuditResponse {
-        events: events
+        next_after_seq: page.next_after_seq,
+        events: page
+            .events
             .into_iter()
             .map(|event| AuditEventResponse {
                 seq: event.seq,
@@ -683,9 +760,18 @@ fn arr12(bytes: Vec<u8>) -> Result<[u8; 12], ApiError> {
     bytes.try_into().map_err(|_| ApiError::BadRequest)
 }
 
-/// DPoP `htu` is the request the server actually received. A client-supplied
-/// `x-dpop-htu` header is not consulted.
-fn request_htu(headers: &HeaderMap, tls: bool) -> Result<String, ApiError> {
+/// DPoP `htu` for `/v1/inject`. With a configured public origin it is that
+/// origin plus the path and the Host header is ignored. Otherwise it is built
+/// from the Host header the server received. A client-supplied `x-dpop-htu`
+/// header is never consulted.
+fn request_htu(
+    headers: &HeaderMap,
+    tls: bool,
+    public_origin: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(origin) = public_origin {
+        return Ok(format!("{origin}/v1/inject"));
+    }
     let host = headers
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())

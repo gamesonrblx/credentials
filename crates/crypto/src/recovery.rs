@@ -140,7 +140,10 @@ pub fn open_recovery_kit(
     key32(plain)
 }
 
-pub fn derive_kit_key(secret: &[u8], params: &KitParams) -> Result<[u8; 32], CryptoError> {
+pub fn derive_kit_key(
+    secret: &[u8],
+    params: &KitParams,
+) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     use argon2::{Algorithm, Argon2, Params, Version};
     let built = Params::new(
         params.memory_kib,
@@ -150,9 +153,9 @@ pub fn derive_kit_key(secret: &[u8], params: &KitParams) -> Result<[u8; 32], Cry
     )
     .map_err(|_| CryptoError::Kdf)?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, built);
-    let mut out = [0u8; 32];
+    let mut out = Zeroizing::new([0u8; 32]);
     argon
-        .hash_password_into(secret, &params.salt, &mut out)
+        .hash_password_into(secret, &params.salt, out.as_mut_slice())
         .map_err(|_| CryptoError::Kdf)?;
     Ok(out)
 }
@@ -180,7 +183,7 @@ fn kit_aad(workspace_id: Uuid, params: &KitParams) -> Vec<u8> {
     aad
 }
 
-fn key32(plain: Vec<u8>) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+fn key32(plain: Zeroizing<Vec<u8>>) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     if plain.len() != 32 {
         return Err(CryptoError::KeyLength);
     }

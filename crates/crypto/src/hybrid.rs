@@ -98,10 +98,14 @@ pub fn unwrap_key_with_aad(
     Ok(out)
 }
 
-fn shared_key_bytes(shared: &x_wing::SharedKey) -> Result<[u8; 32], CryptoError> {
+fn shared_key_bytes(shared: &x_wing::SharedKey) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     let slice = shared.as_slice();
-    let array: [u8; 32] = slice.try_into().map_err(|_| CryptoError::Hybrid)?;
-    Ok(array)
+    if slice.len() != 32 {
+        return Err(CryptoError::Hybrid);
+    }
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(slice);
+    Ok(out)
 }
 
 #[cfg(test)]

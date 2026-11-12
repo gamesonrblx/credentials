@@ -115,7 +115,7 @@ pub fn open_secret(req: OpenSecret<'_>) -> Result<Zeroizing<Vec<u8>>, CryptoErro
         req.payload_ciphertext,
         &payload_aad,
     )?;
-    Ok(Zeroizing::new(plaintext))
+    Ok(plaintext)
 }
 
 /// A KEK already unwrapped in memory, plus the ids bound into the wrap.

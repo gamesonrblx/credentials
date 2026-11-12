@@ -1,10 +1,11 @@
-//! Dev Ed25519 JWTs.
+//! Ed25519 JWTs, audit checkpoints, and end-to-end release grants.
 //!
 //! The signature primitive is `ed25519-dalek`. The JWT encoding is the compact
 //! serialization from RFC 7519: this process only accepts `alg=EdDSA` and a
-//! single audience. The signing key is generated in process memory. A
-//! production issuer would use KMS Sign instead, and startup refuses
-//! `CREDENTIALS_ENV=production` because that signer is not in this build.
+//! single audience. Dev builds keep the seed in memory or in a file marked
+//! DEV ONLY. With `CREDENTIALS_ENV=production` the control plane loads its
+//! seed from a separate file through [`DevSigner::load_production`]; there is
+//! no KMS Sign backend in this build.
 //!
 //! A token carries identity and scope. It does not carry a decryption key.
 
@@ -25,6 +26,18 @@ pub const AUDIENCE: &str = "credentials-gateway";
 pub const MAX_TTL_SECS: u64 = 15 * 60;
 pub const DEFAULT_TTL_SECS: u64 = 5 * 60;
 const LEEWAY_SECS: u64 = 30;
+
+/// Domain prefix for an end-to-end release grant. The signed message is this
+/// prefix followed by the exact grant JSON bytes.
+pub const GRANT_PREFIX: &[u8] = b"credentials.grant.v1\n";
+
+/// The bytes a grant signature covers.
+pub fn grant_message(grant_json: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(GRANT_PREFIX.len() + grant_json.len());
+    message.extend_from_slice(GRANT_PREFIX);
+    message.extend_from_slice(grant_json);
+    message
+}
 
 pub struct DevSigner {
     pub kid: String,
@@ -148,8 +161,26 @@ impl DevSigner {
         }
     }
 
+    /// Sign raw bytes with the gateway key.
+    ///
+    /// One Ed25519 key signs three kinds of message, and each is
+    /// domain-separated: audit checkpoints start with
+    /// `CHECKPOINT_PREFIX` (anchor.rs), release grants start with
+    /// [`GRANT_PREFIX`], and JWTs sign `base64url(header).base64url(payload)`,
+    /// which starts with `eyJ` and so cannot begin with either prefix. A
+    /// caller must not pass a message without one of these framings.
     pub fn sign_message(&self, message: &[u8]) -> Vec<u8> {
         self.signing.sign(message).to_bytes().to_vec()
+    }
+
+    /// Sign a release grant: `GRANT_PREFIX || grant_json`.
+    pub fn sign_grant(&self, grant_json: &[u8]) -> Vec<u8> {
+        self.sign_message(&grant_message(grant_json))
+    }
+
+    /// The 32-byte Ed25519 public key. Published at `GET /v1/keys`.
+    pub fn public_key(&self) -> [u8; 32] {
+        self.signing.verifying_key().to_bytes()
     }
 
     fn write_seed(path: &Path, file: &SignerFile) -> Result<(), ApiError> {
@@ -353,5 +384,17 @@ mod tests {
             .verify(&token, "https://other", AUDIENCE, 100)
             .is_err());
         assert!(signer.verify(&token, iss, "other-aud", 100).is_err());
+    }
+
+    #[test]
+    fn grant_signature_is_domain_separated() {
+        let signer = DevSigner::generate("sign-1").unwrap();
+        let grant = br#"{"v":1}"#;
+        let signature = signer.sign_grant(grant);
+        assert!(signer.verify_message(&grant_message(grant), &signature));
+        assert!(!signer.verify_message(grant, &signature));
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&signer.public_key()).unwrap();
+        let sig = Signature::from_bytes(&<[u8; 64]>::try_from(signature.as_slice()).unwrap());
+        assert!(key.verify(&grant_message(grant), &sig).is_ok());
     }
 }

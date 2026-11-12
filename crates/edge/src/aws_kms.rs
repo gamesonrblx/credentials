@@ -2,22 +2,43 @@
 //!
 //! The hosted control plane must not receive a key policy that allows
 //! `kms:Decrypt` on keys that wrap customer secrets. `kms_key_policy`
-//! binds decrypt to a Nitro PCR measurement.
+//! binds decrypt to one role and a Nitro PCR measurement.
+//!
+//! The gateway does not use this client yet. Only tests call it.
 
 use base64::Engine;
 use credentials_crypto::{CryptoError, KekContext, RootKeyProvider, RootKeyState};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug)]
 pub struct KmsError;
 
+/// AWS KMS JSON client. The secret access key and session token are
+/// zeroized on drop and never printed by `Debug`.
 pub struct AwsKms {
     http: reqwest::Client,
     endpoint: String,
     region: String,
     access_key: String,
-    secret_key: String,
+    secret_key: Zeroizing<String>,
+    session_token: Option<Zeroizing<String>>,
+}
+
+impl std::fmt::Debug for AwsKms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsKms")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl AwsKms {
@@ -27,13 +48,25 @@ impl AwsKms {
         access_key: impl Into<String>,
         secret_key: impl Into<String>,
     ) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http,
             endpoint: endpoint.into().trim_end_matches('/').to_owned(),
             region: region.into(),
             access_key: access_key.into(),
-            secret_key: secret_key.into(),
+            secret_key: Zeroizing::new(secret_key.into()),
+            session_token: None,
         }
+    }
+
+    /// Use temporary credentials (an assumed role, IRSA or an instance
+    /// profile). The token is sent as `X-Amz-Security-Token` and signed.
+    pub fn with_session_token(mut self, token: impl Into<String>) -> Self {
+        self.session_token = Some(Zeroizing::new(token.into()));
+        self
     }
 
     fn call(
@@ -42,11 +75,8 @@ impl AwsKms {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, CryptoError> {
         let payload = serde_json::to_vec(&body).map_err(|_| CryptoError::CorruptStore)?;
-        let url = self.endpoint.clone();
-        let region = self.region.clone();
-        let access = self.access_key.clone();
-        let secret = self.secret_key.clone();
-        let target = target.to_owned();
+        let url = self.endpoint.as_str();
+        let token = self.session_token.as_ref().map(|token| token.as_str());
         let http = self.http.clone();
         std::thread::scope(|scope| {
             scope
@@ -54,25 +84,31 @@ impl AwsKms {
                     tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
-                        .expect("kms runtime")
+                        .map_err(|_| CryptoError::Io)?
                         .block_on(async move {
                             let (amz_date, date_stamp) = amz_now();
-                            let auth = authorization(
+                            let auth = authorization_with_token(
                                 "POST",
-                                &url,
+                                url,
                                 &payload,
-                                &region,
+                                &self.region,
                                 "kms",
-                                &access,
-                                &secret,
+                                &self.access_key,
+                                &self.secret_key,
+                                token,
                                 &amz_date,
                                 &date_stamp,
                             );
-                            http.post(url)
+                            let mut request = http
+                                .post(url)
                                 .header("Content-Type", "application/x-amz-json-1.1")
                                 .header("X-Amz-Target", format!("TrentService.{target}"))
                                 .header("X-Amz-Date", amz_date)
-                                .header("Authorization", auth)
+                                .header("Authorization", auth);
+                            if let Some(token) = token {
+                                request = request.header("X-Amz-Security-Token", token);
+                            }
+                            request
                                 .body(payload)
                                 .send()
                                 .await
@@ -85,7 +121,7 @@ impl AwsKms {
                         })
                 })
                 .join()
-                .expect("kms thread")
+                .unwrap_or(Err(CryptoError::Io))
         })
     }
 }
@@ -185,27 +221,66 @@ fn context_map(context: &KekContext) -> serde_json::Value {
     })
 }
 
-/// Key policy that allows decrypt only when the Nitro attestation PCR0 matches.
-/// The operator's IAM role is not a principal.
-pub fn kms_key_policy(pcr0_hex: &str) -> String {
+/// Key policy for a customer-held KMS key.
+///
+/// `admin_principal_arn` (usually `arn:aws:iam::<account>:root`) may manage
+/// the key but is not granted `kms:Decrypt`, `kms:Encrypt` or data-key
+/// actions. `decrypt_role_arn` may call `kms:Decrypt` only with a Nitro
+/// attestation whose PCR0 equals `pcr0_hex`, and may encrypt freely.
+///
+/// An admin with `kms:PutKeyPolicy` can still rewrite this policy. That is
+/// AWS's model, and CloudTrail records it.
+pub fn kms_key_policy(admin_principal_arn: &str, decrypt_role_arn: &str, pcr0_hex: &str) -> String {
     serde_json::json!({
         "Version": "2012-10-17",
-        "Statement": [{
-            "Sid": "EnclaveDecrypt",
-            "Effect": "Allow",
-            "Principal": {"Service": "kms.amazonaws.com"},
-            "Action": "kms:Decrypt",
-            "Resource": "*",
-            "Condition": {
-                "StringEqualsIgnoreCase": {
-                    "kms:RecipientAttestation:PCR0": pcr0_hex
+        "Statement": [
+            {
+                "Sid": "KeyAdministration",
+                "Effect": "Allow",
+                "Principal": {"AWS": admin_principal_arn},
+                "Action": [
+                    "kms:Create*",
+                    "kms:Describe*",
+                    "kms:Enable*",
+                    "kms:List*",
+                    "kms:Put*",
+                    "kms:Update*",
+                    "kms:Revoke*",
+                    "kms:Disable*",
+                    "kms:Get*",
+                    "kms:Delete*",
+                    "kms:TagResource",
+                    "kms:UntagResource",
+                    "kms:ScheduleKeyDeletion",
+                    "kms:CancelKeyDeletion"
+                ],
+                "Resource": "*"
+            },
+            {
+                "Sid": "RoleEncrypt",
+                "Effect": "Allow",
+                "Principal": {"AWS": decrypt_role_arn},
+                "Action": "kms:Encrypt",
+                "Resource": "*"
+            },
+            {
+                "Sid": "EnclaveDecrypt",
+                "Effect": "Allow",
+                "Principal": {"AWS": decrypt_role_arn},
+                "Action": "kms:Decrypt",
+                "Resource": "*",
+                "Condition": {
+                    "StringEqualsIgnoreCase": {
+                        "kms:RecipientAttestation:PCR0": pcr0_hex
+                    }
                 }
             }
-        }]
+        ]
     })
     .to_string()
 }
 
+/// SigV4 `Authorization` header for long-lived credentials.
 #[allow(clippy::too_many_arguments)]
 pub fn authorization(
     method: &str,
@@ -218,28 +293,69 @@ pub fn authorization(
     amz_date: &str,
     date_stamp: &str,
 ) -> String {
-    let parsed = reqwest::Url::parse(url).expect("url");
-    let host = parsed.host_str().unwrap_or("localhost");
-    let path = if parsed.path().is_empty() {
-        "/"
-    } else {
-        parsed.path()
-    };
+    authorization_with_token(
+        method, url, payload, region, service, access_key, secret_key, None, amz_date, date_stamp,
+    )
+}
+
+/// SigV4 `Authorization` header. With a session token, the caller must send
+/// it as `X-Amz-Security-Token`; it is part of the signed headers.
+/// The host includes a non-default port, as the HTTP `Host` header does.
+#[allow(clippy::too_many_arguments)]
+pub fn authorization_with_token(
+    method: &str,
+    url: &str,
+    payload: &[u8],
+    region: &str,
+    service: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+    amz_date: &str,
+    date_stamp: &str,
+) -> String {
+    let (host, path) = host_and_path(url);
     let hash = hex_encode(&Sha256::digest(payload));
-    let canonical = format!(
-        "{method}\n{path}\n\nhost:{host}\nx-amz-date:{amz_date}\n\nhost;x-amz-date\n{hash}"
-    );
+    let (token_header, signed) = match session_token {
+        Some(token) => (
+            format!("x-amz-security-token:{}\n", token.trim()),
+            "host;x-amz-date;x-amz-security-token",
+        ),
+        None => (String::new(), "host;x-amz-date"),
+    };
+    let canonical = Zeroizing::new(format!(
+        "{method}\n{path}\n\nhost:{host}\nx-amz-date:{amz_date}\n{token_header}\n{signed}\n{hash}"
+    ));
+    drop(Zeroizing::new(token_header));
     let scope = format!("{date_stamp}/{region}/{service}/aws4_request");
     let to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         hex_encode(&Sha256::digest(canonical.as_bytes()))
     );
-    let mut key = signing_key(secret_key, date_stamp, region, service);
-    let sig = hex_encode(&hmac_sha256(&key, to_sign.as_bytes()));
-    key.fill(0);
+    let key = signing_key(secret_key, date_stamp, region, service);
+    let sig = hex_encode(&hmac_sha256(key.as_slice(), to_sign.as_bytes()));
     format!(
-        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders=host;x-amz-date, Signature={sig}"
+        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed}, Signature={sig}"
     )
+}
+
+/// Host (with a non-default port) and path of `url`. An unparsable URL
+/// yields an empty host, so the signature cannot match any real request.
+fn host_and_path(url: &str) -> (String, String) {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return (String::new(), "/".to_owned());
+    };
+    let name = parsed.host_str().unwrap_or("");
+    let host = match parsed.port() {
+        Some(port) => format!("{name}:{port}"),
+        None => name.to_owned(),
+    };
+    let path = if parsed.path().is_empty() {
+        "/".to_owned()
+    } else {
+        parsed.path().to_owned()
+    };
+    (host, path)
 }
 
 /// SigV4 for S3. The host includes the port, and every `x-amz-*` header is signed.
@@ -256,17 +372,7 @@ pub fn s3_authorization(
     date_stamp: &str,
     extra: &[(&str, &str)],
 ) -> (String, String) {
-    let parsed = reqwest::Url::parse(url).expect("url");
-    let host_name = parsed.host_str().unwrap_or("localhost");
-    let host = match parsed.port() {
-        Some(port) => format!("{host_name}:{port}"),
-        None => host_name.to_owned(),
-    };
-    let path = if parsed.path().is_empty() {
-        "/"
-    } else {
-        parsed.path()
-    };
+    let (host, path) = host_and_path(url);
     let hash = hex_encode(&Sha256::digest(payload));
     let mut headers = vec![
         ("host".to_owned(), host),
@@ -295,9 +401,8 @@ pub fn s3_authorization(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         hex_encode(&Sha256::digest(canonical.as_bytes()))
     );
-    let mut key = signing_key(secret_key, date_stamp, region, "s3");
-    let sig = hex_encode(&hmac_sha256(&key, to_sign.as_bytes()));
-    key.fill(0);
+    let key = signing_key(secret_key, date_stamp, region, "s3");
+    let sig = hex_encode(&hmac_sha256(key.as_slice(), to_sign.as_bytes()));
     (
         format!(
             "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed}, Signature={sig}"
@@ -306,11 +411,17 @@ pub fn s3_authorization(
     )
 }
 
-fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
-    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, service.as_bytes());
-    hmac_sha256(&k_service, b"aws4_request").to_vec()
+/// Derive the SigV4 signing key. Every intermediate key is zeroized.
+fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Zeroizing<[u8; 32]> {
+    let seed = Zeroizing::new(format!("AWS4{secret}"));
+    let mut k_date = hmac_sha256(seed.as_bytes(), date.as_bytes());
+    let mut k_region = hmac_sha256(&k_date, region.as_bytes());
+    let mut k_service = hmac_sha256(&k_region, service.as_bytes());
+    let key = Zeroizing::new(hmac_sha256(&k_service, b"aws4_request"));
+    k_date.zeroize();
+    k_region.zeroize();
+    k_service.zeroize();
+    key
 }
 
 pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
@@ -336,6 +447,9 @@ pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let out = outer.finalize();
     let mut result = [0u8; 32];
     result.copy_from_slice(&out);
+    block.zeroize();
+    ipad.zeroize();
+    opad.zeroize();
     result
 }
 
@@ -385,12 +499,186 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    const ADMIN: &str = "arn:aws:iam::111122223333:root";
+    const ROLE: &str = "arn:aws:iam::111122223333:role/enclave";
+
     #[test]
-    fn policy_names_pcr0_and_not_an_operator_user() {
-        let policy = kms_key_policy("abc");
-        assert!(policy.contains("kms:RecipientAttestation:PCR0"));
-        assert!(policy.contains("abc"));
-        assert!(!policy.contains("arn:aws:iam"));
+    fn policy_grants_decrypt_to_the_role_only_with_pcr0() {
+        let policy: serde_json::Value =
+            serde_json::from_str(&kms_key_policy(ADMIN, ROLE, "abc")).unwrap();
+        assert_eq!(policy["Version"], "2012-10-17");
+        let statements = policy["Statement"].as_array().unwrap();
+        assert_eq!(statements.len(), 3);
+        for statement in statements {
+            assert!(statement["Principal"].get("Service").is_none());
+            assert!(statement["Principal"]["AWS"].is_string());
+        }
+        let admin = &statements[0];
+        assert_eq!(admin["Principal"]["AWS"], ADMIN);
+        let admin_actions: Vec<&str> = admin["Action"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|action| action.as_str().unwrap())
+            .collect();
+        assert!(admin_actions.contains(&"kms:Put*"));
+        for forbidden in [
+            "kms:*",
+            "kms:Decrypt",
+            "kms:Encrypt",
+            "kms:GenerateDataKey*",
+            "kms:ReEncrypt*",
+        ] {
+            assert!(!admin_actions.contains(&forbidden));
+        }
+        let encrypt = &statements[1];
+        assert_eq!(encrypt["Principal"]["AWS"], ROLE);
+        assert_eq!(encrypt["Action"], "kms:Encrypt");
+        let decrypt = &statements[2];
+        assert_eq!(decrypt["Principal"]["AWS"], ROLE);
+        assert_eq!(decrypt["Action"], "kms:Decrypt");
+        assert_eq!(
+            decrypt["Condition"]["StringEqualsIgnoreCase"]["kms:RecipientAttestation:PCR0"],
+            "abc"
+        );
+    }
+
+    #[test]
+    fn debug_hides_the_secret_key_and_session_token() {
+        let kms = AwsKms::new(
+            "https://kms.us-east-1.amazonaws.com",
+            "us-east-1",
+            "AKID",
+            "very-secret",
+        )
+        .with_session_token("session-secret");
+        let shown = format!("{kms:?}");
+        assert!(shown.contains("AKID"));
+        assert!(!shown.contains("very-secret"));
+        assert!(!shown.contains("session-secret"));
+    }
+
+    /// AWS SigV4 test suite, `get-vanilla`.
+    #[test]
+    fn signature_matches_the_aws_get_vanilla_vector() {
+        let header = authorization(
+            "GET",
+            "https://example.amazonaws.com/",
+            b"",
+            "us-east-1",
+            "service",
+            "AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            "20150830T123600Z",
+            "20150830",
+        );
+        assert_eq!(
+            header,
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, \
+             SignedHeaders=host;x-amz-date, \
+             Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
+        );
+    }
+
+    #[test]
+    fn a_session_token_is_signed() {
+        let args = (
+            "POST",
+            "https://kms.us-east-1.amazonaws.com/",
+            b"{}".as_slice(),
+            "us-east-1",
+            "kms",
+            "AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        );
+        let plain = authorization_with_token(
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            args.5,
+            args.6,
+            None,
+            "20150830T123600Z",
+            "20150830",
+        );
+        let with_token = authorization_with_token(
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            args.5,
+            args.6,
+            Some("token-a"),
+            "20150830T123600Z",
+            "20150830",
+        );
+        let other_token = authorization_with_token(
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            args.5,
+            args.6,
+            Some("token-b"),
+            "20150830T123600Z",
+            "20150830",
+        );
+        assert_eq!(
+            plain,
+            authorization(
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                "20150830T123600Z",
+                "20150830"
+            )
+        );
+        assert!(with_token.contains("SignedHeaders=host;x-amz-date;x-amz-security-token,"));
+        assert!(!with_token.contains("token-a"));
+        assert_ne!(signature_of(&plain), signature_of(&with_token));
+        assert_ne!(signature_of(&with_token), signature_of(&other_token));
+        // Known answer, computed from the canonical request below with the
+        // same secret, so a change to the token canonicalisation is caught.
+        let canonical = "POST\n/\n\nhost:kms.us-east-1.amazonaws.com\nx-amz-date:20150830T123600Z\nx-amz-security-token:token-a\n\nhost;x-amz-date;x-amz-security-token\n44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+        let scope = "20150830/us-east-1/kms/aws4_request";
+        let to_sign = format!(
+            "AWS4-HMAC-SHA256\n20150830T123600Z\n{scope}\n{}",
+            hex_encode(&Sha256::digest(canonical.as_bytes()))
+        );
+        let key = signing_key(
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            "20150830",
+            "us-east-1",
+            "kms",
+        );
+        assert_eq!(
+            signature_of(&with_token),
+            hex_encode(&hmac_sha256(key.as_slice(), to_sign.as_bytes()))
+        );
+    }
+
+    fn signature_of(header: &str) -> String {
+        header.rsplit("Signature=").next().unwrap().to_owned()
+    }
+
+    #[test]
+    fn the_signed_host_keeps_a_non_default_port() {
+        assert_eq!(
+            host_and_path("http://127.0.0.1:4566"),
+            ("127.0.0.1:4566".to_owned(), "/".to_owned())
+        );
+        assert_eq!(
+            host_and_path("https://kms.us-east-1.amazonaws.com/"),
+            ("kms.us-east-1.amazonaws.com".to_owned(), "/".to_owned())
+        );
     }
 
     #[test]

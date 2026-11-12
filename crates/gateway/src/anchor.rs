@@ -217,20 +217,30 @@ struct FileTip {
     signature_hex: String,
 }
 
+/// Create the anchor file if it is missing. An existing file is never
+/// truncated, so a startup race cannot drop anchored lines.
 fn write_exclusive(path: &Path, bytes: &[u8]) -> Result<(), ApiError> {
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path).map_err(|_| ApiError::StoreUnavailable)?;
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(_) => return Err(ApiError::StoreUnavailable),
+    };
     file.write_all(bytes)
         .map_err(|_| ApiError::StoreUnavailable)?;
+    file.sync_all().map_err(|_| ApiError::StoreUnavailable)?;
+    sync_parent(path);
     Ok(())
 }
 
+/// Append one line and fsync before `put` reports success. The file is
+/// append-only and never rewritten, so no tmp-and-rename step is needed.
 fn append_exclusive(path: &Path, bytes: &[u8]) -> Result<(), ApiError> {
     let mut options = OpenOptions::new();
     options.append(true).create(true);
@@ -242,7 +252,25 @@ fn append_exclusive(path: &Path, bytes: &[u8]) -> Result<(), ApiError> {
     let mut file = options.open(path).map_err(|_| ApiError::StoreUnavailable)?;
     file.write_all(bytes)
         .map_err(|_| ApiError::StoreUnavailable)?;
+    file.sync_all().map_err(|_| ApiError::StoreUnavailable)?;
     Ok(())
+}
+
+/// Make a newly created file's directory entry durable. Unix only; Windows
+/// cannot open a directory for sync.
+fn sync_parent(path: &Path) {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
