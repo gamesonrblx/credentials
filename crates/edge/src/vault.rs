@@ -1,22 +1,36 @@
 //! HashiCorp Vault Transit. The control plane must not hold this token
 //! when the token can decrypt secret-wrapping keys.
+//!
+//! The base URL must be https unless its host is loopback. The gateway does
+//! not use this provider yet. Only the Vault integration test calls it.
 
 use base64::Engine;
 use credentials_crypto::{CryptoError, KekContext, RootKeyProvider, RootKeyState};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
+/// Vault Transit client. The token is zeroized on drop and never printed.
 pub struct VaultTransit {
-    http: reqwest::Client,
+    http: Option<reqwest::Client>,
     base: String,
-    token: String,
+    token: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for VaultTransit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultTransit")
+            .field("base", &self.base)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl VaultTransit {
     pub fn new(base: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::net::http_client(),
             base: base.into().trim_end_matches('/').to_owned(),
-            token: token.into(),
+            token: Zeroizing::new(token.into()),
         }
     }
 
@@ -24,18 +38,36 @@ impl VaultTransit {
         format!("cred-{workspace_id}")
     }
 
-    fn block<T: Send>(fut: impl std::future::Future<Output = T> + Send) -> T {
+    /// URL for `/v1/transit/{action}/{key}`, with the key name encoded.
+    fn url(&self, action: &str, key_ref: &str) -> Result<String, CryptoError> {
+        if !crate::net::is_secure_url(&self.base) {
+            return Err(CryptoError::RootKeyUnavailable);
+        }
+        Ok(format!(
+            "{}/v1/transit/{action}/{}",
+            self.base,
+            crate::net::component(key_ref)
+        ))
+    }
+
+    fn client(&self) -> Result<reqwest::Client, CryptoError> {
+        self.http.clone().ok_or(CryptoError::Io)
+    }
+
+    fn block<T: Send>(
+        fut: impl std::future::Future<Output = Result<T, CryptoError>> + Send,
+    ) -> Result<T, CryptoError> {
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
-                        .expect("vault runtime")
+                        .map_err(|_| CryptoError::Io)?
                         .block_on(fut)
                 })
                 .join()
-                .expect("vault thread")
+                .unwrap_or(Err(CryptoError::Io))
         })
     }
 }
@@ -43,9 +75,9 @@ impl VaultTransit {
 impl RootKeyProvider for VaultTransit {
     fn create_tenant_root(&self, workspace_id: Uuid) -> Result<String, CryptoError> {
         let name = Self::key_name(workspace_id);
-        let url = format!("{}/v1/transit/keys/{name}", self.base);
-        let token = self.token.clone();
-        let http = self.http.clone();
+        let url = self.url("keys", &name)?;
+        let token = self.token.as_str();
+        let http = self.client()?;
         Self::block(async move {
             http.post(url)
                 .header("X-Vault-Token", token)
@@ -65,12 +97,12 @@ impl RootKeyProvider for VaultTransit {
         plaintext: &[u8],
         _context: &KekContext,
     ) -> Result<Vec<u8>, CryptoError> {
-        let url = format!("{}/v1/transit/encrypt/{key_ref}", self.base);
+        let url = self.url("encrypt", key_ref)?;
         let body = serde_json::json!({
             "plaintext": base64::engine::general_purpose::STANDARD.encode(plaintext)
         });
-        let token = self.token.clone();
-        let http = self.http.clone();
+        let token = self.token.as_str();
+        let http = self.client()?;
         let text = Self::block(async move {
             let value: serde_json::Value = http
                 .post(url)
@@ -100,10 +132,10 @@ impl RootKeyProvider for VaultTransit {
         _context: &KekContext,
     ) -> Result<zeroize::Zeroizing<Vec<u8>>, CryptoError> {
         let ciphertext = std::str::from_utf8(blob).map_err(|_| CryptoError::CorruptStore)?;
-        let url = format!("{}/v1/transit/decrypt/{key_ref}", self.base);
+        let url = self.url("decrypt", key_ref)?;
         let body = serde_json::json!({"ciphertext": ciphertext});
-        let token = self.token.clone();
-        let http = self.http.clone();
+        let token = self.token.as_str();
+        let http = self.client()?;
         let plain = Self::block(async move {
             let value: serde_json::Value = http
                 .post(url)
