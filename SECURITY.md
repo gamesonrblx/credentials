@@ -4,7 +4,7 @@ Credentials stores secrets. Please report vulnerabilities privately.
 
 Use GitHub private vulnerability reporting:
 
-https://github.com/gamesonrblx/credentials/security/advisories/new
+https://github.com/tacticocc/credentials/security/advisories/new
 
 Do not open a public GitHub issue for a suspected vulnerability, and do not include secret values, tokens, or key material in a report.
 
