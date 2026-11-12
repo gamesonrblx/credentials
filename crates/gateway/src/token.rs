@@ -8,9 +8,15 @@
 //!
 //! A token carries identity and scope. It does not carry a decryption key.
 
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::Path;
+
+use credentials_crypto::DevPolicy;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::b64::{b64url_decode, b64url_encode};
 use crate::ApiError;
@@ -60,15 +66,133 @@ struct Cnf {
 
 impl DevSigner {
     pub fn generate(kid: impl Into<String>) -> Result<Self, ApiError> {
-        let mut seed = [0u8; 32];
-        credentials_crypto::random_bytes(&mut seed).map_err(|_| ApiError::KmsUnavailable)?;
-        Ok(Self {
-            kid: kid.into(),
-            signing: SigningKey::from_bytes(&seed),
-        })
+        let mut seed = Zeroizing::new([0u8; 32]);
+        credentials_crypto::random_bytes(seed.as_mut_slice())
+            .map_err(|_| ApiError::KmsUnavailable)?;
+        Ok(Self::from_seed(kid, seed.as_slice()))
     }
 
-    pub fn sign(&self, iss: &str, claims: &AgentClaims) -> Result<String, ApiError> {
+    /// Signing seed for the production control plane. Refused in dev, and
+    /// refused if the file is a dev signer seed. This key signs tokens and
+    /// audit tips. It does not unwrap secrets.
+    pub fn load_production(path: &Path, policy: DevPolicy) -> Result<Self, ApiError> {
+        if policy.allow_dev {
+            return Err(ApiError::KmsUnavailable);
+        }
+        if path.exists() {
+            let bytes = fs::read(path).map_err(|_| ApiError::KmsUnavailable)?;
+            let file: SignerFile =
+                serde_json::from_slice(&bytes).map_err(|_| ApiError::KmsUnavailable)?;
+            if file.warning.contains("DEV ONLY") {
+                return Err(ApiError::KmsUnavailable);
+            }
+            let seed =
+                Zeroizing::new(hex_decode(&file.seed_hex).map_err(|_| ApiError::KmsUnavailable)?);
+            if seed.len() != 32 {
+                return Err(ApiError::KmsUnavailable);
+            }
+            return Ok(Self::from_seed(file.kid, seed.as_slice()));
+        }
+        let signer = Self::generate("sign-1")?;
+        let seed = signer.signing.to_bytes();
+        let file = SignerFile {
+            warning: "Signing seed for tokens and audit tips. Not a secret-unwrapping key."
+                .to_owned(),
+            kid: signer.kid.clone(),
+            seed_hex: hex_encode(&seed),
+        };
+        Self::write_seed(path, &file)?;
+        Ok(signer)
+    }
+
+    /// Dev signing seed on disk. Refused when `CREDENTIALS_ENV=production`.
+    /// The database must not hold this seed.
+    pub fn load_or_create(path: &Path, policy: DevPolicy) -> Result<Self, ApiError> {
+        if !policy.allow_dev {
+            return Err(ApiError::KmsUnavailable);
+        }
+        if path.exists() {
+            let bytes = fs::read(path).map_err(|_| ApiError::KmsUnavailable)?;
+            let file: SignerFile =
+                serde_json::from_slice(&bytes).map_err(|_| ApiError::KmsUnavailable)?;
+            let seed =
+                Zeroizing::new(hex_decode(&file.seed_hex).map_err(|_| ApiError::KmsUnavailable)?);
+            if seed.len() != 32 {
+                return Err(ApiError::KmsUnavailable);
+            }
+            return Ok(Self::from_seed(file.kid, seed.as_slice()));
+        }
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|_| ApiError::KmsUnavailable)?;
+            }
+        }
+        let signer = Self::generate("dev-1")?;
+        let seed = signer.signing.to_bytes();
+        let file = SignerFile {
+            warning: "DEV ONLY. Not for production. This file contains a raw signing seed."
+                .to_owned(),
+            kid: signer.kid.clone(),
+            seed_hex: hex_encode(&seed),
+        };
+        Self::write_seed(path, &file)?;
+        Ok(signer)
+    }
+
+    fn from_seed(kid: impl Into<String>, seed: &[u8]) -> Self {
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(&seed[..32]);
+        Self {
+            kid: kid.into(),
+            signing: SigningKey::from_bytes(&raw),
+        }
+    }
+
+    pub fn sign_message(&self, message: &[u8]) -> Vec<u8> {
+        self.signing.sign(message).to_bytes().to_vec()
+    }
+
+    fn write_seed(path: &Path, file: &SignerFile) -> Result<(), ApiError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|_| ApiError::KmsUnavailable)?;
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(file).map_err(|_| ApiError::KmsUnavailable)?;
+        let tmp = path.with_extension("tmp");
+        {
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut out = options.open(&tmp).map_err(|_| ApiError::KmsUnavailable)?;
+            out.write_all(&bytes)
+                .map_err(|_| ApiError::KmsUnavailable)?;
+            out.sync_all().map_err(|_| ApiError::KmsUnavailable)?;
+        }
+        fs::rename(&tmp, path).map_err(|_| ApiError::KmsUnavailable)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    pub fn verify_message(&self, message: &[u8], signature: &[u8]) -> bool {
+        let Ok(bytes) = <[u8; 64]>::try_from(signature) else {
+            return false;
+        };
+        self.signing
+            .verifying_key()
+            .verify(message, &Signature::from_bytes(&bytes))
+            .is_ok()
+    }
+
+    pub fn sign(&self, iss: &str, aud: &str, claims: &AgentClaims) -> Result<String, ApiError> {
         if claims.exp <= claims.iat || claims.exp - claims.iat > MAX_TTL_SECS {
             return Err(ApiError::BadRequest);
         }
@@ -78,7 +202,7 @@ impl DevSigner {
         );
         let wire = WireClaims {
             iss: iss.to_owned(),
-            aud: AUDIENCE.to_owned(),
+            aud: aud.to_owned(),
             sub: format!("agent:{}", claims.agent_id),
             iat: claims.iat,
             nbf: claims.iat,
@@ -105,7 +229,13 @@ impl DevSigner {
         ))
     }
 
-    pub fn verify(&self, token: &str, iss: &str, now: u64) -> Result<AgentClaims, ApiError> {
+    pub fn verify(
+        &self,
+        token: &str,
+        iss: &str,
+        aud: &str,
+        now: u64,
+    ) -> Result<AgentClaims, ApiError> {
         let (header_b64, payload_b64, sig_b64) = split_jwt(token)?;
         let header: serde_json::Value = serde_json::from_slice(&b64url_decode(header_b64)?)
             .map_err(|_| ApiError::Unauthenticated)?;
@@ -128,7 +258,7 @@ impl DevSigner {
             .map_err(|_| ApiError::Unauthenticated)?;
         let wire: WireClaims = serde_json::from_slice(&b64url_decode(payload_b64)?)
             .map_err(|_| ApiError::Unauthenticated)?;
-        if wire.iss != iss || wire.aud != AUDIENCE {
+        if wire.iss != iss || wire.aud != aud {
             return Err(ApiError::Unauthenticated);
         }
         if wire.exp <= wire.iat || wire.exp - wire.iat > MAX_TTL_SECS {
@@ -171,6 +301,33 @@ fn json_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+#[derive(Serialize, Deserialize)]
+struct SignerFile {
+    warning: String,
+    kid: String,
+    seed_hex: String,
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>, ()> {
+    if !value.len().is_multiple_of(2) {
+        return Err(());
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&value[i..i + 2], 16).map_err(|_| ()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,9 +346,12 @@ mod tests {
             jkt: "thumb".into(),
         };
         let iss = "https://credentials.local/v1";
-        let token = signer.sign(iss, &claims).unwrap();
-        assert!(signer.verify(&token, iss, 100).is_ok());
-        assert!(signer.verify(&token, iss, 10_000).is_err());
-        assert!(signer.verify(&token, "https://other", 100).is_err());
+        let token = signer.sign(iss, AUDIENCE, &claims).unwrap();
+        assert!(signer.verify(&token, iss, AUDIENCE, 100).is_ok());
+        assert!(signer.verify(&token, iss, AUDIENCE, 10_000).is_err());
+        assert!(signer
+            .verify(&token, "https://other", AUDIENCE, 100)
+            .is_err());
+        assert!(signer.verify(&token, iss, "other-aud", 100).is_err());
     }
 }

@@ -1,0 +1,161 @@
+openapi: 3.0.3
+info:
+  title: Credentials
+  version: 0.1.0
+  description: >
+    Pre-alpha public API. This gateway can read secret plaintext. It is not
+    zero-knowledge against the operator. No customer, SOC 2, or certification
+    claim.
+servers:
+  - url: https://credentials.local
+paths:
+  /v1/workspaces:
+    post:
+      operationId: createWorkspace
+      responses:
+        "200":
+          description: Workspace id and a credential shown once.
+  /v1/secrets:
+    post:
+      operationId: createSecret
+      security:
+        - workspaceCredential: []
+      responses:
+        "200":
+          description: First version of the secret.
+  /v1/secrets/{name}/versions:
+    post:
+      operationId: createSecretVersion
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - workspaceCredential: []
+      responses:
+        "200":
+          description: A new version. The previous ciphertext is kept.
+  /v1/secrets/{name}/disable:
+    post:
+      operationId: disableSecret
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - workspaceCredential: []
+      responses:
+        "204":
+          description: Later inject fails before unwrap.
+  /v1/agents:
+    post:
+      operationId: createAgent
+      security:
+        - workspaceCredential: []
+      responses:
+        "200":
+          description: Agent id.
+  /v1/agent-sessions:
+    post:
+      operationId: createAgentSession
+      security:
+        - workspaceCredential: []
+      responses:
+        "200":
+          description: Session id and agent token.
+    get:
+      operationId: listAgentSessions
+      security:
+        - workspaceCredential: []
+      responses:
+        "200":
+          description: Sessions for the workspace. Tokens are not returned.
+  /v1/agent-sessions/{id}/revoke:
+    post:
+      operationId: revokeAgentSession
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      security:
+        - workspaceCredential: []
+      responses:
+        "204":
+          description: The session is revoked.
+  /v1/inject:
+    post:
+      operationId: inject
+      security:
+        - agentToken: []
+      responses:
+        "200":
+          description: Upstream status and base64 body. Proxy is the public-listener mode. On the local socket, env and header return base64 of {env_name,value} or {header_name,value}. The public listener refuses those modes.
+        "503":
+          description: Audit append failed, the anchor lagged, or the KMS is down.
+  /v1/audit:
+    get:
+      operationId: readAudit
+      security:
+        - workspaceCredential: []
+      parameters:
+        - name: agent_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Events with hashes and the latest checkpoint signature.
+  /v1/kek/rotate:
+    post:
+      operationId: rotateKek
+      security:
+        - workspaceCredential: []
+      responses:
+        "200":
+          description: New KEK version. Payload ciphertext is unchanged.
+  /v1/workspaces/{id}/deletion:
+    post:
+      operationId: deleteWorkspace
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      security:
+        - workspaceCredential: []
+      responses:
+        "202":
+          description: Deletion is scheduled. Confirm the workspace id.
+  /v1/workspaces/{id}/deletion/cancel:
+    post:
+      operationId: cancelWorkspaceDeletion
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      security:
+        - workspaceCredential: []
+      responses:
+        "204":
+          description: Allowed only while the root key is still pending destruction.
+components:
+  securitySchemes:
+    workspaceCredential:
+      type: http
+      scheme: bearer
+    agentToken:
+      type: http
+      scheme: bearer

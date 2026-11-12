@@ -24,4 +24,6 @@ pub enum CryptoError {
     CorruptStore,
     #[error("hybrid key transport failed")]
     Hybrid,
+    #[error("key derivation failed")]
+    Kdf,
 }

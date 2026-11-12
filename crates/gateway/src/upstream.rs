@@ -60,7 +60,73 @@ impl Upstream for RecordingUpstream {
     }
 }
 
-/// Used by the dev binary. Inject returns 502 until a real upstream is configured.
+/// HTTPS client for proxy injection.
+///
+/// The scheme must be `https`. Redirects are not followed. The secret header
+/// replaces any previous value and is not copied onto the response.
+pub struct HttpUpstream {
+    client: reqwest::Client,
+}
+
+impl HttpUpstream {
+    pub fn new() -> Result<Self, ApiError> {
+        Self::build(false)
+    }
+
+    /// Trusts any certificate. Tests use this against a local server.
+    /// `cargo run` uses [`HttpUpstream::new`].
+    pub fn new_insecure() -> Result<Self, ApiError> {
+        Self::build(true)
+    }
+
+    fn build(insecure: bool) -> Result<Self, ApiError> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .danger_accept_invalid_certs(insecure)
+            .build()
+            .map_err(|_| ApiError::UpstreamFailed)?;
+        Ok(Self { client })
+    }
+}
+
+impl Default for HttpUpstream {
+    fn default() -> Self {
+        Self::new().expect("https client")
+    }
+}
+
+#[async_trait]
+impl Upstream for HttpUpstream {
+    async fn forward(&self, request: Outbound) -> Result<Inbound, ApiError> {
+        let url = url::Url::parse(&request.url).map_err(|_| ApiError::UpstreamFailed)?;
+        if url.scheme() != "https" {
+            return Err(ApiError::UpstreamFailed);
+        }
+        let method = reqwest::Method::from_bytes(request.method.as_bytes())
+            .map_err(|_| ApiError::UpstreamFailed)?;
+        let name = reqwest::header::HeaderName::from_bytes(request.header_name.as_bytes())
+            .map_err(|_| ApiError::UpstreamFailed)?;
+        let value = reqwest::header::HeaderValue::from_str(&request.header_value)
+            .map_err(|_| ApiError::UpstreamFailed)?;
+        let response = self
+            .client
+            .request(method, url)
+            .header(name, value)
+            .body(request.body)
+            .send()
+            .await
+            .map_err(|_| ApiError::UpstreamFailed)?;
+        let status = response.status().as_u16();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|_| ApiError::UpstreamFailed)?
+            .to_vec();
+        Ok(Inbound { status, body })
+    }
+}
+
+/// Kept so a test can still force an upstream failure. `cargo run` uses [`HttpUpstream`].
 pub struct UnconfiguredUpstream;
 
 #[async_trait]

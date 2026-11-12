@@ -5,7 +5,7 @@ use std::sync::Arc;
 use credentials_crypto::{CountingProvider, DevPolicy, MemoryRootKeys};
 use credentials_gateway::{
     generate_dpop, verify_chain, Delivery, DeliveryPolicy, Gateway, InjectRequest, ManualClock,
-    MemoryStore, Now, RecordingUpstream,
+    MemoryStore, Now, RecordingUpstream, Store,
 };
 
 struct Env {
@@ -18,7 +18,7 @@ struct Env {
     workspace: uuid::Uuid,
 }
 
-fn setup() -> Env {
+async fn setup() -> Env {
     let store = Arc::new(MemoryStore::new());
     let kms = Arc::new(CountingProvider::new(
         MemoryRootKeys::new(DevPolicy { allow_dev: true }).unwrap(),
@@ -27,7 +27,7 @@ fn setup() -> Env {
     let clock = Arc::new(ManualClock::new(1_700_000_000));
     let gateway =
         Gateway::new(store.clone(), kms.clone(), upstream.clone(), clock.clone()).unwrap();
-    let created = gateway.create_workspace().unwrap();
+    let created = gateway.create_workspace().await.unwrap();
     Env {
         gateway,
         store,
@@ -68,7 +68,7 @@ fn request(token: &str, proof: &str, htu: &str) -> InjectRequest {
 
 #[tokio::test]
 async fn proxy_inject_happy_path_writes_the_audit_chain() {
-    let env = setup();
+    let env = setup().await;
     env.gateway
         .create_secret(
             &env.credential,
@@ -76,9 +76,14 @@ async fn proxy_inject_happy_path_writes_the_audit_chain() {
             b"sk-test-value",
             policy(),
         )
+        .await
         .unwrap();
     let dpop = generate_dpop().unwrap();
-    let agent = env.gateway.create_agent(&env.credential, "runner").unwrap();
+    let agent = env
+        .gateway
+        .create_agent(&env.credential, "runner")
+        .await
+        .unwrap();
     let session = env
         .gateway
         .create_session(
@@ -88,6 +93,7 @@ async fn proxy_inject_happy_path_writes_the_audit_chain() {
             Some(300),
             dpop.public_b64(),
         )
+        .await
         .unwrap();
     let htu = "https://credentials.local/v1/inject";
     let proof = dpop.proof(
@@ -111,29 +117,60 @@ async fn proxy_inject_happy_path_writes_the_audit_chain() {
     // The KEK unwrapped while storing the secret may still be in the 60s cache.
     assert!(env.kms.decrypts() >= before);
     assert!(before >= 1);
-    let log = env.gateway.audit_log(&env.credential, Some(agent)).unwrap();
+    let log = env
+        .gateway
+        .audit_log(&env.credential, Some(agent))
+        .await
+        .unwrap();
     assert!(log
         .iter()
         .any(|event| event.event_type == "secret.access.delivered"));
-    let full = env.gateway.audit_log(&env.credential, None).unwrap();
+    let full = env.gateway.audit_log(&env.credential, None).await.unwrap();
     assert!(verify_chain(&full));
 }
 
 #[tokio::test]
-async fn revoked_and_expired_tokens_do_not_unwrap() {
-    let env = setup();
-    env.gateway
+async fn a_new_version_does_not_replace_the_previous_ciphertext() {
+    let env = setup().await;
+    let first = env
+        .gateway
         .create_secret(
             &env.credential,
             "prod/openai/api_key",
-            b"sk-test-value",
+            b"version-one",
             policy(),
         )
+        .await
         .unwrap();
-    let decrypts_after_write = env.kms.decrypts();
-
+    let second = env
+        .gateway
+        .create_version(&env.credential, "prod/openai/api_key", b"version-two")
+        .await
+        .unwrap();
+    assert_eq!(second.secret_id, first.secret_id);
+    assert_eq!(second.version, 2);
+    let latest = Store::latest_version(env.store.as_ref(), first.secret_id)
+        .await
+        .unwrap();
+    let rows = Store::versions_for_kek(env.store.as_ref(), latest.kek_id)
+        .await
+        .unwrap();
+    let mut ours: Vec<_> = rows
+        .into_iter()
+        .filter(|row| row.secret_id == first.secret_id)
+        .collect();
+    ours.sort_by_key(|row| row.version);
+    assert_eq!(ours.len(), 2);
+    assert_ne!(
+        ours[0].sealed.payload_ciphertext,
+        ours[1].sealed.payload_ciphertext
+    );
     let dpop = generate_dpop().unwrap();
-    let agent = env.gateway.create_agent(&env.credential, "runner").unwrap();
+    let agent = env
+        .gateway
+        .create_agent(&env.credential, "runner")
+        .await
+        .unwrap();
     let session = env
         .gateway
         .create_session(
@@ -143,9 +180,115 @@ async fn revoked_and_expired_tokens_do_not_unwrap() {
             Some(60),
             dpop.public_b64(),
         )
+        .await
+        .unwrap();
+    let htu = "https://credentials.local/v1/inject";
+    let proof = dpop.proof(
+        "POST",
+        htu,
+        &session.token,
+        env.clock.unix_secs(),
+        "proof-v2",
+    );
+    let response = env
+        .gateway
+        .inject(request(&session.token, &proof, htu))
+        .await
+        .unwrap();
+    assert_eq!(response.body, b"upstream-ok");
+    assert_eq!(
+        env.upstream.last_value().as_deref(),
+        Some("Bearer version-two")
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_secret_does_not_unwrap() {
+    let env = setup().await;
+    env.gateway
+        .create_secret(
+            &env.credential,
+            "prod/openai/api_key",
+            b"sk-test-value",
+            policy(),
+        )
+        .await
+        .unwrap();
+    env.gateway
+        .disable_secret(&env.credential, "prod/openai/api_key")
+        .await
+        .unwrap();
+    let decrypts = env.kms.decrypts();
+    let dpop = generate_dpop().unwrap();
+    let agent = env
+        .gateway
+        .create_agent(&env.credential, "runner")
+        .await
+        .unwrap();
+    let session = env
+        .gateway
+        .create_session(
+            &env.credential,
+            agent,
+            vec!["secret:inject:prod/openai/api_key".into()],
+            Some(60),
+            dpop.public_b64(),
+        )
+        .await
+        .unwrap();
+    let listed = env.gateway.list_sessions(&env.credential).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    let htu = "https://credentials.local/v1/inject";
+    let proof = dpop.proof(
+        "POST",
+        htu,
+        &session.token,
+        env.clock.unix_secs(),
+        "proof-off",
+    );
+    let err = env
+        .gateway
+        .inject(request(&session.token, &proof, htu))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "forbidden");
+    assert_eq!(env.kms.decrypts(), decrypts);
+}
+
+#[tokio::test]
+async fn revoked_and_expired_tokens_do_not_unwrap() {
+    let env = setup().await;
+    env.gateway
+        .create_secret(
+            &env.credential,
+            "prod/openai/api_key",
+            b"sk-test-value",
+            policy(),
+        )
+        .await
+        .unwrap();
+    let decrypts_after_write = env.kms.decrypts();
+
+    let dpop = generate_dpop().unwrap();
+    let agent = env
+        .gateway
+        .create_agent(&env.credential, "runner")
+        .await
+        .unwrap();
+    let session = env
+        .gateway
+        .create_session(
+            &env.credential,
+            agent,
+            vec!["secret:inject:prod/openai/api_key".into()],
+            Some(60),
+            dpop.public_b64(),
+        )
+        .await
         .unwrap();
     env.gateway
         .revoke_session(&env.credential, session.session_id)
+        .await
         .unwrap();
     let htu = "https://credentials.local/v1/inject";
     let proof = dpop.proof(
@@ -173,6 +316,7 @@ async fn revoked_and_expired_tokens_do_not_unwrap() {
             Some(60),
             dpop.public_b64(),
         )
+        .await
         .unwrap();
     env.clock.set(env.clock.unix_secs() + 10_000);
     let proof = dpop.proof(
@@ -193,7 +337,7 @@ async fn revoked_and_expired_tokens_do_not_unwrap() {
 
 #[tokio::test]
 async fn audit_failure_does_not_decrypt() {
-    let env = setup();
+    let env = setup().await;
     env.gateway
         .create_secret(
             &env.credential,
@@ -201,10 +345,15 @@ async fn audit_failure_does_not_decrypt() {
             b"sk-test-value",
             policy(),
         )
+        .await
         .unwrap();
     let decrypts_after_write = env.kms.decrypts();
     let dpop = generate_dpop().unwrap();
-    let agent = env.gateway.create_agent(&env.credential, "runner").unwrap();
+    let agent = env
+        .gateway
+        .create_agent(&env.credential, "runner")
+        .await
+        .unwrap();
     let session = env
         .gateway
         .create_session(
@@ -214,6 +363,7 @@ async fn audit_failure_does_not_decrypt() {
             Some(60),
             dpop.public_b64(),
         )
+        .await
         .unwrap();
     env.store.set_fail_appends(true);
     let htu = "https://credentials.local/v1/inject";
@@ -236,7 +386,7 @@ async fn audit_failure_does_not_decrypt() {
 
 #[tokio::test]
 async fn rotation_and_deletion() {
-    let env = setup();
+    let env = setup().await;
     env.gateway
         .create_secret(
             &env.credential,
@@ -244,12 +394,31 @@ async fn rotation_and_deletion() {
             b"sk-test-value",
             policy(),
         )
+        .await
         .unwrap();
-    assert_eq!(env.gateway.rotate_kek(&env.credential).unwrap(), 2);
-    assert_eq!(env.gateway.rotate_kek(&env.credential).unwrap(), 3);
+    assert_eq!(env.gateway.rotate_kek(&env.credential).await.unwrap(), 2);
+    assert_eq!(
+        env.gateway
+            .rewrap_outstanding(&env.credential)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(env.gateway.rotate_kek(&env.credential).await.unwrap(), 3);
+    assert_eq!(
+        env.gateway
+            .rewrap_outstanding(&env.credential)
+            .await
+            .unwrap(),
+        0
+    );
 
     let dpop = generate_dpop().unwrap();
-    let agent = env.gateway.create_agent(&env.credential, "runner").unwrap();
+    let agent = env
+        .gateway
+        .create_agent(&env.credential, "runner")
+        .await
+        .unwrap();
     let session = env
         .gateway
         .create_session(
@@ -259,10 +428,12 @@ async fn rotation_and_deletion() {
             Some(60),
             dpop.public_b64(),
         )
+        .await
         .unwrap();
     let decrypts = env.kms.decrypts();
     env.gateway
         .delete_workspace(&env.credential, env.workspace)
+        .await
         .unwrap();
     let htu = "https://credentials.local/v1/inject";
     let proof = dpop.proof(
@@ -279,6 +450,62 @@ async fn rotation_and_deletion() {
         .unwrap_err();
     assert_eq!(err.code(), "workspace_deleting");
     assert_eq!(env.kms.decrypts(), decrypts);
+}
+
+#[tokio::test]
+async fn cancel_restores_a_workspace_and_shred_is_terminal() {
+    let env = setup().await;
+    env.gateway
+        .create_secret(
+            &env.credential,
+            "prod/openai/api_key",
+            b"before-delete",
+            policy(),
+        )
+        .await
+        .unwrap();
+    env.gateway
+        .delete_workspace(&env.credential, env.workspace)
+        .await
+        .unwrap();
+    assert_eq!(env.gateway.poll_shreds().await.unwrap(), 0);
+    env.gateway
+        .cancel_deletion(&env.credential, env.workspace)
+        .await
+        .unwrap();
+    env.gateway
+        .create_secret(
+            &env.credential,
+            "prod/openai/api_key",
+            b"after-cancel",
+            policy(),
+        )
+        .await
+        .unwrap();
+    env.gateway
+        .delete_workspace(&env.credential, env.workspace)
+        .await
+        .unwrap();
+    let decrypts = env.kms.decrypts();
+    env.clock.set(env.clock.unix_secs() + 8 * 24 * 3600);
+    assert_eq!(env.gateway.poll_shreds().await.unwrap(), 1);
+    let err = env
+        .gateway
+        .cancel_deletion(&env.credential, env.workspace)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "unauthenticated");
+    assert_eq!(env.kms.decrypts(), decrypts);
+    let events = Store::audit_for_workspace(env.store.as_ref(), env.workspace)
+        .await
+        .unwrap();
+    assert!(verify_chain(&events));
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "tenant.delete.cancelled"));
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "tenant.shredded"));
 }
 
 fn request_with_body(token: &str, proof: &str, htu: &str) -> InjectRequest {

@@ -4,6 +4,10 @@
 //! attach a DPoP proof signed with `ed25519-dalek`. Secret values are base64
 //! on the wire and are not written to logs by this crate.
 
+mod tls;
+
+pub use tls::{hybrid_config, hybrid_http, HYBRID_GROUP};
+
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
@@ -73,7 +77,7 @@ impl DpopKey {
 impl CredentialsClient {
     pub fn new(base: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: tls::hybrid_http(false),
             base: base.into().trim_end_matches('/').to_owned(),
             credential: None,
         }
@@ -112,6 +116,79 @@ impl CredentialsClient {
             self.auth(),
         )
         .await
+    }
+
+    pub async fn create_version(
+        &self,
+        name: &str,
+        value: &[u8],
+    ) -> Result<VersionCreated, ClientError> {
+        let body = serde_json::json!({ "value": STANDARD.encode(value) });
+        self.send(
+            self.http
+                .post(format!("{}/v1/secrets/{name}/versions", self.base))
+                .json(&body),
+            self.auth(),
+        )
+        .await
+    }
+
+    pub async fn disable_secret(&self, name: &str) -> Result<(), ClientError> {
+        self.send_empty(
+            self.http
+                .post(format!("{}/v1/secrets/{name}/disable", self.base))
+                .json(&serde_json::json!({})),
+            self.auth(),
+        )
+        .await
+    }
+
+    pub async fn revoke_session(&self, session_id: Uuid) -> Result<(), ClientError> {
+        self.send_empty(
+            self.http.post(format!(
+                "{}/v1/agent-sessions/{session_id}/revoke",
+                self.base
+            )),
+            self.auth(),
+        )
+        .await
+    }
+
+    pub async fn delete_workspace(&self, id: Uuid) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "confirm": id });
+        self.send_empty(
+            self.http
+                .post(format!("{}/v1/workspaces/{id}/deletion", self.base))
+                .json(&body),
+            self.auth(),
+        )
+        .await
+    }
+
+    pub async fn cancel_deletion(&self, id: Uuid) -> Result<(), ClientError> {
+        self.send_empty(
+            self.http
+                .post(format!("{}/v1/workspaces/{id}/deletion/cancel", self.base))
+                .json(&serde_json::json!({})),
+            self.auth(),
+        )
+        .await
+    }
+
+    pub async fn list_sessions(&self) -> Result<SessionList, ClientError> {
+        self.send(
+            self.http.get(format!("{}/v1/agent-sessions", self.base)),
+            self.auth(),
+        )
+        .await
+    }
+
+    pub async fn audit(&self, agent_id: Option<Uuid>) -> Result<AuditPage, ClientError> {
+        let mut url = format!("{}/v1/audit", self.base);
+        if let Some(agent_id) = agent_id {
+            url.push_str(&format!("?agent_id={agent_id}"));
+        }
+        self.send(self.http.get(url), self.auth()).await
     }
 
     pub async fn create_agent(&self, display_name: &str) -> Result<AgentCreated, ClientError> {
@@ -211,6 +288,15 @@ impl CredentialsClient {
             serde_json::from_str(&body).map_err(|_| ClientError::Decode)
         }
     }
+
+    async fn send_empty(
+        &self,
+        request: reqwest::RequestBuilder,
+        headers: Option<HeaderMap>,
+    ) -> Result<(), ClientError> {
+        let _: serde_json::Value = self.send(request, headers).await?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +328,32 @@ pub struct SessionCreated {
 pub struct InjectResult {
     pub upstream_status: u16,
     pub body: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionList {
+    pub sessions: Vec<SessionItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionItem {
+    pub session_id: Uuid,
+    pub agent_id: Uuid,
+    pub expires_at: u64,
+    pub revoked_at: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditPage {
+    pub events: Vec<AuditEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditEvent {
+    pub seq: u64,
+    pub event_type: String,
+    pub hash_hex: String,
+    pub prev_hash_hex: String,
 }
 
 fn b64url(bytes: &[u8]) -> String {

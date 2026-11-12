@@ -17,6 +17,7 @@ const LEEWAY_SECS: u64 = 30;
 #[derive(Clone, Debug)]
 pub struct DpopMaterial {
     pub jkt: String,
+    pub jti: String,
 }
 
 pub struct DpopKey {
@@ -123,6 +124,7 @@ pub fn verify_dpop(
     }
     Ok(DpopMaterial {
         jkt: thumbprint(x_b64),
+        jti: body.jti,
     })
 }
 

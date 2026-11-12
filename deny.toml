@@ -2,6 +2,20 @@
 version = 2
 yanked = "deny"
 unmaintained = "workspace"
+# sqlx 0.8 pins libsqlite3-sys 0.30.1. The patched release is 0.39, which
+# that pin cannot take. The bundled copy is what Windows and macOS CI link.
+# The gateway creates its own database and does not open WAL mode, which is
+# the condition in RUSTSEC-2026-0459. Drop this ignore when sqlx moves up.
+# RUSTSEC-2023-0071 is the Marvin timing leak in RSA private-key
+# operations. `cargo tree -i rsa@0.10.0-rc.19` has one path: rsa, then
+# crypto-glue 0.2.2, then webauthn-rs-core 0.6.2, then webauthn-rs 0.6.2,
+# then credentials-edge. webauthn-rs-core calls only
+# RS256VerifyingKey::verify on a credential public key. crypto-glue's RSA
+# decrypt and signing helpers have no caller in webauthn-rs,
+# webauthn-attestation-ca, or this tree. OIDC login does not verify a JWT.
+# sqlx-mysql pins rsa 0.9.10, and this workspace does not enable MySQL.
+# Drop this ignore when crypto-glue depends on rsa >=0.10.0.
+ignore = ["RUSTSEC-2026-0459", "RUSTSEC-2023-0071"]
 
 [licenses]
 version = 2
@@ -11,6 +25,10 @@ allow = [
     "MIT",
     "BSD-3-Clause",
     "Unicode-3.0",
+    "Zlib",
+    "ISC",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
 ]
 
 [bans]

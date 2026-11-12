@@ -46,6 +46,102 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
 
+  test-postgres:
+    name: test (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: credentials
+          POSTGRES_PASSWORD: credentials
+          POSTGRES_DB: credentials
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U credentials -d credentials"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p credentials-gateway --locked --test durable -- --test-threads=1
+        env:
+          CREDENTIALS_TEST_POSTGRES: postgres://credentials:credentials@localhost:5432/credentials?sslmode=disable
+
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: credentials
+          POSTGRES_PASSWORD: credentials
+          POSTGRES_DB: credentials
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U credentials -d credentials"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      localstack:
+        image: localstack/localstack:3
+        env:
+          SERVICES: kms
+        ports:
+          - 4566:4566
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start MinIO and Vault
+        run: |
+          docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin cgr.dev/chainguard/minio:latest server /data
+          docker run -d --name vault --cap-add IPC_LOCK -p 8200:8200 -e VAULT_DEV_ROOT_TOKEN_ID=root -e VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200 hashicorp/vault:1.18 server -dev
+      - name: Start Dex
+        run: |
+          cat > "$RUNNER_TEMP/dex.yaml" << 'EOF'
+          issuer: http://127.0.0.1:5556/dex
+          storage:
+            type: memory
+          web:
+            http: 0.0.0.0:5556
+          oauth2:
+            skipApprovalScreen: true
+          staticClients:
+          - id: credentials
+            redirectURIs:
+            - http://127.0.0.1:8080/v1/login/callback
+            name: Credentials
+            secret: secret
+          enablePasswordDB: true
+          staticPasswords:
+          - email: admin@example.com
+            hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+            username: admin
+            userID: 08a8684b-db88-4b73-90a9-3cd1661f5466
+          EOF
+          docker run -d --name dex --network host -v "$RUNNER_TEMP/dex.yaml:/etc/dex/config.yaml:ro" dexidp/dex:v2.41.1 dex serve /etc/dex/config.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Wait for services
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:4566/_localstack/health && curl -sf http://127.0.0.1:8200/v1/sys/health && curl -sf http://127.0.0.1:9000/minio/health/live && break
+            sleep 2
+          done
+      - name: Container integration tests
+        run: cargo test -p credentials-edge --locked --test live --test fixtures -- --test-threads=1
+        env:
+          CREDENTIALS_INTEGRATION: "1"
+          CREDENTIALS_TEST_KMS: http://127.0.0.1:4566
+          CREDENTIALS_TEST_MINIO: http://127.0.0.1:9000
+          CREDENTIALS_TEST_VAULT: http://127.0.0.1:8200
+          CREDENTIALS_TEST_DEX: http://127.0.0.1:5556/dex
+          CREDENTIALS_TEST_POSTGRES: postgres://credentials:credentials@localhost:5432/credentials?sslmode=disable
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
