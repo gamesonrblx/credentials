@@ -1,11 +1,13 @@
 //! Associated data for payload encryption and DEK wrapping.
 //!
-//! Layouts are normative in `docs/ENCRYPTION.md` section 5. A future encoding
-//! uses a new magic. Writers here emit `CRD1` only.
+//! Layouts are normative in `docs/ENCRYPTION.md`. Gateway rows use `CRD1`.
+//! End-to-end rows use `CRD2`. A reader switches on the magic.
 
 use uuid::Uuid;
 
 pub const MAGIC: &[u8; 4] = b"CRD1";
+pub const MAGIC_E2E: &[u8; 4] = b"CRD2";
+pub const E2E_WRAP_GENERATION: u32 = 1;
 pub const PURPOSE_PAYLOAD: u8 = 0x01;
 pub const PURPOSE_DEK: u8 = 0x02;
 pub const ALG_AES_256_GCM_V1: u8 = 0x01;
@@ -41,6 +43,38 @@ pub fn dek_aad(
     out[37..53].copy_from_slice(version_id.as_bytes());
     out[53..69].copy_from_slice(kek_id.as_bytes());
     out[69..73].copy_from_slice(&kek_version.to_be_bytes());
+    out[73] = ALG_AES_256_GCM_V1;
+    out
+}
+
+/// 54-byte payload associated data for an end-to-end row.
+pub fn payload_aad_e2e(
+    workspace_id: Uuid,
+    secret_id: Uuid,
+    version_id: Uuid,
+) -> [u8; PAYLOAD_AAD_LEN] {
+    let mut out = payload_aad(workspace_id, secret_id, version_id);
+    out[0..4].copy_from_slice(MAGIC_E2E);
+    out
+}
+
+/// 74-byte data-key wrap associated data for an end-to-end row.
+///
+/// The 16-byte id is the customer workspace key, not a tenant KEK.
+pub fn dek_aad_e2e(
+    workspace_id: Uuid,
+    secret_id: Uuid,
+    version_id: Uuid,
+    workspace_key_id: Uuid,
+) -> [u8; DEK_AAD_LEN] {
+    let mut out = [0u8; DEK_AAD_LEN];
+    out[0..4].copy_from_slice(MAGIC_E2E);
+    out[4] = PURPOSE_DEK;
+    out[5..21].copy_from_slice(workspace_id.as_bytes());
+    out[21..37].copy_from_slice(secret_id.as_bytes());
+    out[37..53].copy_from_slice(version_id.as_bytes());
+    out[53..69].copy_from_slice(workspace_key_id.as_bytes());
+    out[69..73].copy_from_slice(&E2E_WRAP_GENERATION.to_be_bytes());
     out[73] = ALG_AES_256_GCM_V1;
     out
 }

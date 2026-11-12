@@ -49,12 +49,22 @@ pub fn generate_hybrid_keypair() -> Result<HybridKeyPair, CryptoError> {
     })
 }
 
+pub const HYBRID_WRAP_AAD: &[u8] = b"credentials.hybrid.wrap.v1";
+
 pub fn wrap_key(encapsulation_key: &[u8], key: &[u8; 32]) -> Result<HybridWrapped, CryptoError> {
+    wrap_key_with_aad(encapsulation_key, key, HYBRID_WRAP_AAD)
+}
+
+pub fn wrap_key_with_aad(
+    encapsulation_key: &[u8],
+    key: &[u8; 32],
+    aad: &[u8],
+) -> Result<HybridWrapped, CryptoError> {
     let pk = EncapsulationKey::try_from(encapsulation_key).map_err(|_| CryptoError::Hybrid)?;
     let (ct, shared) = pk.encapsulate();
     let shared_bytes = shared_key_bytes(&shared)?;
     let nonce: [u8; 12] = random_array()?;
-    let ciphertext = seal(&shared_bytes, &nonce, key, b"credentials.hybrid.wrap.v1")?;
+    let ciphertext = seal(&shared_bytes, &nonce, key, aad)?;
     Ok(HybridWrapped {
         encapsulation: ct.as_slice().to_vec(),
         nonce,
@@ -66,17 +76,20 @@ pub fn unwrap_key(
     decapsulation_key: &[u8; 32],
     wrapped: &HybridWrapped,
 ) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+    unwrap_key_with_aad(decapsulation_key, wrapped, HYBRID_WRAP_AAD)
+}
+
+pub fn unwrap_key_with_aad(
+    decapsulation_key: &[u8; 32],
+    wrapped: &HybridWrapped,
+    aad: &[u8],
+) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     let sk = DecapsulationKey::from(*decapsulation_key);
     let shared = sk
         .decapsulate_slice(&wrapped.encapsulation)
         .map_err(|_| CryptoError::Hybrid)?;
     let shared_bytes = shared_key_bytes(&shared)?;
-    let plain = open(
-        &shared_bytes,
-        &wrapped.nonce,
-        &wrapped.ciphertext,
-        b"credentials.hybrid.wrap.v1",
-    )?;
+    let plain = open(&shared_bytes, &wrapped.nonce, &wrapped.ciphertext, aad)?;
     if plain.len() != 32 {
         return Err(CryptoError::KeyLength);
     }
