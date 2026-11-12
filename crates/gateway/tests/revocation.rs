@@ -20,6 +20,7 @@ fn inject_request(token: &str, proof: &str) -> InjectRequest {
         htm: "POST".into(),
         htu: "https://credentials.local/v1/inject".into(),
         local_channel: false,
+        content_type: None,
     }
 }
 

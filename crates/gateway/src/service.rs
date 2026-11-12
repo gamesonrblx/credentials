@@ -21,12 +21,14 @@ use crate::anchor::{
     checkpoint_message, AuditAnchor, MemoryAnchor, AUDIT_ANCHOR_MAX_LAG, CHECKPOINT_EVERY_EVENTS,
     CHECKPOINT_EVERY_SECS,
 };
-use crate::audit::{verify_chain, AuditDraft, AuditRecord, AuditValue};
+use crate::audit::{
+    verify_agent_window, verify_chain, verify_window, AuditDraft, AuditRecord, AuditValue,
+};
 use crate::dpop::{self, DpopKey};
 use crate::names::valid_secret_name;
 use crate::policy::{
-    delivery_allowed, format_header, host_allowed, https_host, scope_allowed_on_agent,
-    scope_allows, validate_policy, Delivery, DeliveryPolicy,
+    delivery_allowed, format_header, host_allowed, https_host, method_allowed,
+    scope_allowed_on_agent, scope_allows, validate_policy, Delivery, DeliveryPolicy,
 };
 use crate::store::{
     AgentRow, KekRow, RecipientRow, RewrapJobRow, SecretRow, SessionRow, Store, VersionRow,
@@ -38,6 +40,17 @@ use crate::ApiError;
 
 pub const ISSUER: &str = "https://credentials.local/v1";
 const KEK_CACHE_TTL: Duration = Duration::from_secs(60);
+/// A deleted workspace can be restored for this long before it is shredded.
+pub const DELETION_RETENTION_SECS: u64 = 7 * 24 * 3600;
+/// Lifetime of an end-to-end release grant.
+pub const GRANT_TTL_SECS: u64 = 60;
+/// `GET /v1/audit` page size when `limit` is absent, and its ceiling.
+pub const AUDIT_PAGE_DEFAULT: u32 = 500;
+pub const AUDIT_PAGE_MAX: u32 = 1000;
+/// Shorter needles would match ordinary upstream bytes too often, so the
+/// reflection check skips them. A secret under 8 bytes is still caught when
+/// its formatted header value (for example `Bearer abc`) is 8 bytes or more.
+const MIN_REFLECTION_LEN: usize = 8;
 
 pub struct Clock;
 
@@ -113,8 +126,18 @@ pub struct Gateway {
     kek_cache: Mutex<HashMap<Uuid, CachedKek>>,
     kek_flight: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
     anchor_track: Mutex<AnchorTrack>,
+    /// Per-workspace result of checking the anchored tip against the store,
+    /// once per process. `false` means a mismatch, which stays refused.
+    anchor_checked: Mutex<HashMap<Uuid, bool>>,
     pub metrics_integrity: AtomicU64,
     unwrap_secrets: bool,
+    public_origin: Option<String>,
+}
+
+/// One page of `GET /v1/audit`. `next_after_seq` is set when the page is full.
+pub struct AuditPage {
+    pub events: Vec<AuditRecord>,
+    pub next_after_seq: Option<u64>,
 }
 
 pub struct CreatedWorkspace {
@@ -145,6 +168,8 @@ pub struct InjectRequest {
     pub htm: String,
     pub htu: String,
     pub local_channel: bool,
+    /// Content-Type of the proxied request body. Signed into an end-to-end grant.
+    pub content_type: Option<String>,
 }
 
 pub struct InjectResponse {
@@ -210,7 +235,8 @@ impl Gateway {
         signer: DevSigner,
         anchor: Arc<dyn AuditAnchor>,
     ) -> Result<Self, ApiError> {
-        if !DevPolicy::from_env().allow_dev {
+        // An unreadable or unknown CREDENTIALS_ENV refuses the dev gateway.
+        if !DevPolicy::from_env().is_ok_and(|policy| policy.allow_dev) {
             return Err(ApiError::KmsUnavailable);
         }
         let started_at = clock.unix_secs();
@@ -231,8 +257,10 @@ impl Gateway {
                 failed_since: None,
                 max_lag: AUDIT_ANCHOR_MAX_LAG,
             }),
+            anchor_checked: Mutex::new(HashMap::new()),
             metrics_integrity: AtomicU64::new(0),
             unwrap_secrets: true,
+            public_origin: None,
         })
     }
 
@@ -268,13 +296,34 @@ impl Gateway {
                 failed_since: None,
                 max_lag: AUDIT_ANCHOR_MAX_LAG,
             }),
+            anchor_checked: Mutex::new(HashMap::new()),
             metrics_integrity: AtomicU64::new(0),
             unwrap_secrets: false,
+            public_origin: None,
         })
     }
 
     pub fn set_issuer(&mut self, issuer: impl Into<String>) {
         self.issuer = issuer.into();
+    }
+
+    /// Public origin such as `https://gw.example.com`. When set, DPoP `htu`
+    /// is this origin plus the request path, and the Host header is ignored.
+    /// A trailing slash is dropped.
+    pub fn set_public_origin(&mut self, origin: Option<String>) {
+        self.public_origin = origin
+            .map(|value| value.trim_end_matches('/').to_owned())
+            .filter(|value| !value.is_empty());
+    }
+
+    pub fn public_origin(&self) -> Option<&str> {
+        self.public_origin.as_deref()
+    }
+
+    /// The key that signs tokens, checkpoints and release grants, as
+    /// `(kid, Ed25519 public key)`.
+    pub fn signing_key(&self) -> (&str, [u8; 32]) {
+        (self.signer.kid.as_str(), self.signer.public_key())
     }
 
     pub fn set_audience(&mut self, audience: impl Into<String>) {
@@ -318,6 +367,7 @@ impl Gateway {
                     kms_key_ref: key_ref.clone(),
                     credential_hash: hash,
                     audit_seq: 0,
+                    delete_after: None,
                 },
                 KekRow {
                     id: kek_id,
@@ -530,29 +580,40 @@ impl Gateway {
                 ("wrap_mode".into(), AuditValue::String("e2e".into())),
             ],
         );
-        if self.store.secret_by_name(workspace.id, name).await.is_err() {
-            self.store
-                .insert_secret(
-                    SecretRow {
-                        id: submitted.secret_id,
-                        workspace_id: workspace.id,
-                        name: name.to_owned(),
-                        status: "active".to_owned(),
-                        policy,
-                    },
-                    version,
-                    audit,
-                )
-                .await?;
-            return Ok(CreatedVersion {
-                secret_id: submitted.secret_id,
-                version_id: submitted.version_id,
-                version: 1,
-            });
-        }
-        let secret = self.store.secret_by_name(workspace.id, name).await?;
+        // Only a missing secret creates one. A store error must not be read
+        // as "not found", or a second row would be attempted.
+        let secret = match self.store.secret_by_name(workspace.id, name).await {
+            Ok(secret) => secret,
+            Err(ApiError::NotFound) => {
+                self.store
+                    .insert_secret(
+                        SecretRow {
+                            id: submitted.secret_id,
+                            workspace_id: workspace.id,
+                            name: name.to_owned(),
+                            status: "active".to_owned(),
+                            policy,
+                        },
+                        version,
+                        audit,
+                    )
+                    .await?;
+                return Ok(CreatedVersion {
+                    secret_id: submitted.secret_id,
+                    version_id: submitted.version_id,
+                    version: 1,
+                });
+            }
+            Err(err) => return Err(err),
+        };
         if secret.id != submitted.secret_id {
             return Err(ApiError::BadRequest);
+        }
+        // A new version cannot change the delivery policy: the store has no
+        // policy update, and the grant signs the stored policy. A caller that
+        // sends a different policy is told so instead of silently ignored.
+        if secret.policy != policy {
+            return Err(ApiError::InvalidPolicy);
         }
         let latest = self.store.latest_version(secret.id).await?;
         let version_n = latest.version.checked_add(1).ok_or(ApiError::BadRequest)?;
@@ -684,6 +745,9 @@ impl Gateway {
         if ttl == 0 || ttl > MAX_TTL_SECS {
             return Err(ApiError::BadRequest);
         }
+        if !dpop::valid_public_key(dpop_public_b64) {
+            return Err(ApiError::BadRequest);
+        }
         let jkt = dpop::thumbprint(dpop_public_b64);
         let now = self.clock.unix_secs();
         let session_id = Uuid::now_v7();
@@ -796,19 +860,35 @@ impl Gateway {
         if agent.status != "active" {
             return Err(ApiError::Unauthenticated);
         }
-        let proof = dpop::verify_dpop(
+        let proof = match dpop::verify_dpop(
             &request.dpop,
             &request.token,
             &request.htm,
             &request.htu,
             self.clock.unix_secs(),
-        )?;
+        ) {
+            Ok(proof) => proof,
+            Err(err) => {
+                self.deny(workspace.id, claims.agent_id, "dpop").await?;
+                return Err(err);
+            }
+        };
         if proof.jkt != claims.jkt {
+            self.deny(workspace.id, claims.agent_id, "dpop").await?;
             return Err(ApiError::Unauthenticated);
         }
-        self.store
+        match self
+            .store
             .claim_dpop_jti(&proof.jti, workspace.id, now + 900)
-            .await?;
+            .await
+        {
+            Ok(()) => {}
+            Err(ApiError::Unauthenticated) => {
+                self.deny(workspace.id, claims.agent_id, "dpop").await?;
+                return Err(ApiError::Unauthenticated);
+            }
+            Err(err) => return Err(err),
+        }
 
         let secret = match self
             .store
@@ -817,17 +897,24 @@ impl Gateway {
         {
             Ok(secret) => secret,
             Err(ApiError::NotFound) => {
-                self.audit_or_fail(
-                    workspace.id,
-                    Some(claims.agent_id),
-                    "secret.access.denied",
+                // The requested name is agent input. Record it only when it
+                // is a well-formed secret name.
+                let fields = if valid_secret_name(&request.secret) {
                     vec![
                         ("reason".into(), AuditValue::String("not_found".into())),
                         (
                             "secret_name".into(),
                             AuditValue::String(request.secret.clone()),
                         ),
-                    ],
+                    ]
+                } else {
+                    vec![("reason".into(), AuditValue::String("invalid_name".into()))]
+                };
+                self.audit_or_fail(
+                    workspace.id,
+                    Some(claims.agent_id),
+                    "secret.access.denied",
+                    fields,
                 )
                 .await?;
                 return Err(ApiError::NotFound);
@@ -858,6 +945,14 @@ impl Gateway {
             return Err(ApiError::Forbidden);
         }
         let host = if matches!(request.delivery, Delivery::Proxy) {
+            if !method_allowed(&request.method) {
+                self.deny(workspace.id, claims.agent_id, "method").await?;
+                return Err(ApiError::Forbidden);
+            }
+            if !plain_authority(&request.url) {
+                self.deny(workspace.id, claims.agent_id, "url").await?;
+                return Err(ApiError::Forbidden);
+            }
             let host = https_host(&request.url).ok_or(ApiError::Forbidden)?;
             if !host_allowed(&secret.policy.hosts, &host) {
                 self.audit_or_fail(
@@ -873,6 +968,12 @@ impl Gateway {
         } else {
             None
         };
+        // Both paths need the policy fields for the chosen delivery. A
+        // policy without them is denied before anything is released.
+        let Some(target) = delivery_target(&secret.policy, request.delivery) else {
+            self.deny(workspace.id, claims.agent_id, "policy").await?;
+            return Err(ApiError::Forbidden);
+        };
 
         self.audit_or_fail(
             workspace.id,
@@ -886,7 +987,15 @@ impl Gateway {
         let version = self.store.latest_version(secret.id).await?;
         if version.wrap_mode == WrapMode::E2e {
             return self
-                .release_ciphertext(workspace.id, Some(claims.agent_id), &version)
+                .release_ciphertext(
+                    workspace.id,
+                    claims.agent_id,
+                    &secret,
+                    &version,
+                    &request,
+                    host.as_deref(),
+                    &target,
+                )
                 .await;
         }
         if version.wrap_mode != WrapMode::Gateway || version.e2e_encapsulation.is_some() {
@@ -940,52 +1049,50 @@ impl Gateway {
             }
         };
 
-        let response = match request.delivery {
-            Delivery::Proxy => {
-                let header_name = secret
-                    .policy
-                    .header_name
-                    .clone()
-                    .ok_or(ApiError::Forbidden)?;
-                let header_value = format_header(
-                    secret.policy.header_format.as_deref().unwrap_or(""),
-                    plaintext.as_slice(),
-                )
-                .ok_or(ApiError::Forbidden)?;
-                self.upstream
+        let response = match (request.delivery, &target) {
+            (Delivery::Proxy, DeliveryTarget::Header { name, format }) => {
+                let header_value =
+                    format_header(format, plaintext.as_slice()).ok_or(ApiError::Forbidden)?;
+                let check_value = ZeroizingBuf::new(header_value.clone());
+                let forwarded = self
+                    .upstream
                     .forward(Outbound {
                         method: request.method,
                         url: request.url,
                         body: request.body,
-                        header_name,
+                        header_name: name.clone(),
                         header_value,
+                        content_type: request.content_type,
                     })
-                    .await
+                    .await;
+                if let Ok(inbound) = &forwarded {
+                    if reflects(&inbound.body, plaintext.as_slice())
+                        || reflects(&inbound.body, check_value.as_bytes())
+                    {
+                        let _ = self
+                            .store
+                            .append_audit(self.audit(
+                                workspace.id,
+                                Some(claims.agent_id),
+                                "secret.access.failed",
+                                vec![("reason".into(), AuditValue::String("reflected".into()))],
+                            ))
+                            .await;
+                        return Err(ApiError::UpstreamFailed);
+                    }
+                }
+                forwarded
             }
-            Delivery::Header => {
-                let header_name = secret
-                    .policy
-                    .header_name
-                    .clone()
-                    .ok_or(ApiError::Forbidden)?;
-                let value = format_header(
-                    secret.policy.header_format.as_deref().unwrap_or(""),
-                    plaintext.as_slice(),
-                )
-                .ok_or(ApiError::Forbidden)?;
-                let body = serde_json::json!({ "header_name": header_name, "value": value });
+            (Delivery::Header, DeliveryTarget::Header { name, format }) => {
+                let value =
+                    format_header(format, plaintext.as_slice()).ok_or(ApiError::Forbidden)?;
+                let body = serde_json::json!({ "header_name": name, "value": value });
                 Ok(crate::upstream::Inbound {
                     status: 200,
                     body: serde_json::to_vec(&body).unwrap_or_default(),
                 })
             }
-            Delivery::Env => {
-                let env_name = secret
-                    .policy
-                    .env_name
-                    .clone()
-                    .filter(|name| !name.is_empty())
-                    .ok_or(ApiError::Forbidden)?;
+            (Delivery::Env, DeliveryTarget::Env { name: env_name }) => {
                 let value = std::str::from_utf8(plaintext.as_slice())
                     .map_err(|_| ApiError::DecryptFailed)?;
                 let body = serde_json::json!({ "env_name": env_name, "value": value });
@@ -994,6 +1101,8 @@ impl Gateway {
                     body: serde_json::to_vec(&body).unwrap_or_default(),
                 })
             }
+            // delivery_target returns the variant that matches the delivery.
+            _ => return Err(ApiError::Forbidden),
         };
         let response = match response {
             Ok(response) => response,
@@ -1025,28 +1134,58 @@ impl Gateway {
         })
     }
 
+    /// Release end-to-end ciphertext with a signed grant. The grant states
+    /// what was authorised, so the customer injector can refuse anything
+    /// else. See [`build_grant`] for the fields.
+    #[allow(clippy::too_many_arguments)]
     async fn release_ciphertext(
         &self,
         workspace_id: Uuid,
-        agent_id: Option<Uuid>,
+        agent_id: Uuid,
+        secret: &SecretRow,
         version: &VersionRow,
+        request: &InjectRequest,
+        host: Option<&str>,
+        target: &DeliveryTarget,
     ) -> Result<InjectResponse, ApiError> {
         let key = self.store.workspace_key(workspace_id).await?;
         let encapsulation = version
             .e2e_encapsulation
             .as_deref()
             .ok_or(ApiError::DecryptFailed)?;
+        let iat = self.clock.unix_secs();
+        let grant = build_grant(&GrantInput {
+            issuer: &self.issuer,
+            kid: &self.signer.kid,
+            workspace_id,
+            agent_id: Some(agent_id),
+            secret,
+            version,
+            workspace_key_id: key.id,
+            request,
+            host,
+            target,
+            iat,
+        })?;
+        let grant_signature = self.signer.sign_grant(&grant);
         self.audit_or_fail(
             workspace_id,
-            agent_id,
+            Some(agent_id),
             "secret.ciphertext.released",
             vec![
                 ("version_id".into(), AuditValue::Uuid(version.id)),
                 ("wrap_mode".into(), AuditValue::String("e2e".into())),
+                (
+                    "grant_sha256".into(),
+                    AuditValue::String(hex_lower(&sha256(&grant))),
+                ),
             ],
         )
         .await?;
         let body = serde_json::json!({
+            "grant": crate::b64::b64std_encode(&grant),
+            "grant_signature": crate::b64::b64std_encode(&grant_signature),
+            "grant_kid": self.signer.kid,
             "wrap_mode": "e2e",
             "workspace_id": workspace_id,
             "secret_id": version.secret_id,
@@ -1143,26 +1282,49 @@ impl Gateway {
             return Err(ApiError::WorkspaceDeleting);
         }
         let now = self.clock.unix_secs();
-        self.store
-            .set_workspace_status(workspace.id, "deleting")
-            .await?;
+        let delete_after = now.saturating_add(DELETION_RETENTION_SECS);
+        // Dev path: the root key is scheduled first, so a KMS failure leaves
+        // the workspace active. The control plane holds no root key; its
+        // deadline lives only in the store.
+        if self.unwrap_secrets {
+            self.kms
+                .schedule_destruction(&workspace.kms_key_ref, delete_after)
+                .map_err(map_crypto)?;
+        }
+        if let Err(err) = self
+            .store
+            .schedule_workspace_deletion(workspace.id, delete_after)
+            .await
+        {
+            if self.unwrap_secrets && self.kms.cancel_destruction(&workspace.kms_key_ref).is_err() {
+                tracing::warn!(workspace_id = %workspace.id, "root key destruction was not rolled back");
+            }
+            return Err(err);
+        }
         self.store
             .revoke_workspace_sessions(workspace.id, now)
             .await?;
         self.drop_workspace_keks(workspace.id);
-        self.kms
-            .schedule_destruction(&workspace.kms_key_ref, now + 7 * 24 * 3600)
-            .map_err(map_crypto)?;
         self.store
-            .append_audit(self.audit(workspace.id, None, "tenant.delete.scheduled", Vec::new()))
+            .append_audit(self.audit(
+                workspace.id,
+                None,
+                "tenant.delete.scheduled",
+                vec![("delete_after".into(), AuditValue::U64(delete_after))],
+            ))
             .await?;
-        self.store.delete_secret_material(workspace.id).await?;
+        // Dev rows go now; the root key is the shred. The control plane keeps
+        // the ciphertext until the deadline so a cancel can restore it.
+        if self.unwrap_secrets {
+            self.store.delete_secret_material(workspace.id).await?;
+        }
         Ok(())
     }
 
-    /// Allowed only while the root key is still pending destruction.
-    /// Rows removed at schedule time stay removed. A fresh KEK is minted
-    /// when none is active, so the workspace can store new secrets.
+    /// Allowed only inside the retention window. On the dev path the root key
+    /// must still be pending destruction; rows removed at schedule time stay
+    /// removed and a fresh KEK is minted. On the control plane the stored
+    /// deadline decides and the ciphertext rows are still in place.
     pub async fn cancel_deletion(&self, credential: &str, id: Uuid) -> Result<(), ApiError> {
         let workspace = self.authenticate_workspace(credential).await?;
         if workspace.id != id {
@@ -1171,23 +1333,42 @@ impl Gateway {
         if workspace.status != "deleting" {
             return Err(ApiError::BadRequest);
         }
-        let state = self
-            .kms
-            .root_key_state(&workspace.kms_key_ref)
-            .map_err(map_crypto)?;
-        let RootKeyState::Pending { not_before_unix } = state else {
-            return Err(ApiError::BadRequest);
-        };
-        if self.clock.unix_secs() >= not_before_unix {
+        let now = self.clock.unix_secs();
+        let mut pending_root = None;
+        if self.unwrap_secrets {
+            let state = self
+                .kms
+                .root_key_state(&workspace.kms_key_ref)
+                .map_err(map_crypto)?;
+            let RootKeyState::Pending { not_before_unix } = state else {
+                return Err(ApiError::BadRequest);
+            };
+            if now >= not_before_unix {
+                return Err(ApiError::BadRequest);
+            }
+            self.kms
+                .cancel_destruction(&workspace.kms_key_ref)
+                .map_err(map_crypto)?;
+            pending_root = Some(not_before_unix);
+        } else if !workspace
+            .delete_after
+            .is_some_and(|deadline| now < deadline)
+        {
             return Err(ApiError::BadRequest);
         }
-        self.kms
-            .cancel_destruction(&workspace.kms_key_ref)
-            .map_err(map_crypto)?;
-        self.store
-            .set_workspace_status(workspace.id, "active")
-            .await?;
-        if self.store.active_kek(workspace.id).await.is_err() {
+        if let Err(err) = self.store.cancel_workspace_deletion(workspace.id).await {
+            if let Some(not_before) = pending_root {
+                if self
+                    .kms
+                    .schedule_destruction(&workspace.kms_key_ref, not_before)
+                    .is_err()
+                {
+                    tracing::warn!(workspace_id = %workspace.id, "root key destruction was not restored");
+                }
+            }
+            return Err(err);
+        }
+        if self.unwrap_secrets && self.store.active_kek(workspace.id).await.is_err() {
             self.mint_kek(&workspace).await?;
         }
         self.store
@@ -1196,31 +1377,77 @@ impl Gateway {
         Ok(())
     }
 
-    /// Sets `shredded` once the root key waiting period has elapsed.
+    /// Shred every `deleting` workspace whose deadline has passed. A failure
+    /// on one workspace is logged and the loop moves on. Returns the number
+    /// shredded in this pass.
     pub async fn poll_shreds(&self) -> Result<u32, ApiError> {
         let now = self.clock.unix_secs();
         let mut count = 0u32;
         for workspace in self.store.workspaces_with_status("deleting").await? {
-            let due = self
-                .kms
-                .destroy_if_due(&workspace.kms_key_ref, now)
-                .map_err(map_crypto)?;
-            if !due {
-                continue;
+            match self.shred_if_due(&workspace, now).await {
+                Ok(true) => count += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(workspace_id = %workspace.id, error = %err, "workspace shred failed");
+                }
             }
-            self.store
-                .revoke_workspace_credentials(workspace.id, now)
-                .await?;
-            self.store
-                .set_workspace_status(workspace.id, "shredded")
-                .await?;
-            self.drop_workspace_keks(workspace.id);
-            self.store
-                .append_audit(self.audit(workspace.id, None, "tenant.shredded", Vec::new()))
-                .await?;
-            count += 1;
         }
         Ok(count)
+    }
+
+    async fn shred_if_due(&self, workspace: &WorkspaceRow, now: u64) -> Result<bool, ApiError> {
+        let due = if self.unwrap_secrets {
+            self.kms
+                .destroy_if_due(&workspace.kms_key_ref, now)
+                .map_err(map_crypto)?
+        } else {
+            workspace
+                .delete_after
+                .is_some_and(|deadline| now >= deadline)
+        };
+        if !due {
+            return Ok(false);
+        }
+        if !self.unwrap_secrets {
+            self.store.delete_secret_material(workspace.id).await?;
+        }
+        self.store
+            .revoke_workspace_credentials(workspace.id, now)
+            .await?;
+        self.store
+            .append_audit(self.audit(workspace.id, None, "tenant.shredded", Vec::new()))
+            .await?;
+        self.store
+            .set_workspace_status(workspace.id, "shredded")
+            .await?;
+        self.drop_workspace_keks(workspace.id);
+        Ok(true)
+    }
+
+    /// Replace the workspace credential. The new value is stored hashed, the
+    /// presented one stops working, and `workspace.credential.rotated` is
+    /// written in the same transaction.
+    pub async fn rotate_workspace_credential(&self, credential: &str) -> Result<String, ApiError> {
+        let old_hash = credential_hash(credential)?;
+        let workspace = self.store.workspace_by_hash(&old_hash).await?;
+        self.ensure_active(&workspace)?;
+        let fresh = ZeroizingBuf::new(random_32()?);
+        let new_hash = sha256(fresh.as_slice());
+        self.store
+            .rotate_workspace_credential(
+                workspace.id,
+                &old_hash,
+                new_hash,
+                self.clock.unix_secs(),
+                self.audit(
+                    workspace.id,
+                    None,
+                    "workspace.credential.rotated",
+                    Vec::new(),
+                ),
+            )
+            .await?;
+        Ok(crate::b64::b64url_encode(fresh.as_slice()))
     }
 
     async fn mint_kek(&self, workspace: &WorkspaceRow) -> Result<(), ApiError> {
@@ -1269,6 +1496,66 @@ impl Gateway {
             return Err(ApiError::DecryptFailed);
         }
         Ok(events)
+    }
+
+    /// One page of the audit log, for `GET /v1/audit`. Only the page is
+    /// loaded. It is checked for internal linkage and for its link to the
+    /// event before it; [`Gateway::audit_log`] remains the full-chain export.
+    /// `limit` defaults to 500 and is capped at 1000; 0 is a bad request.
+    pub async fn audit_page(
+        &self,
+        credential: &str,
+        agent_id: Option<Uuid>,
+        after_seq: u64,
+        limit: Option<u32>,
+    ) -> Result<AuditPage, ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        let limit = limit.unwrap_or(AUDIT_PAGE_DEFAULT).min(AUDIT_PAGE_MAX);
+        if limit == 0 {
+            return Err(ApiError::BadRequest);
+        }
+        let events = self
+            .store
+            .audit_page(workspace.id, agent_id, after_seq, limit)
+            .await?;
+        let intact = match (agent_id, events.first()) {
+            (_, None) => true,
+            (None, Some(_)) => {
+                let prev = self.hash_at(workspace.id, after_seq).await?;
+                prev.is_some_and(|prev| verify_window(prev, after_seq, &events))
+            }
+            (Some(_), Some(first)) => {
+                let prev = self
+                    .hash_at(workspace.id, first.seq.saturating_sub(1))
+                    .await?;
+                prev == Some(first.prev_hash) && verify_agent_window(&events)
+            }
+        };
+        if !intact {
+            self.metrics_integrity.fetch_add(1, Ordering::Relaxed);
+            return Err(ApiError::DecryptFailed);
+        }
+        let next_after_seq = if events.len() == limit as usize {
+            events.last().map(|event| event.seq)
+        } else {
+            None
+        };
+        Ok(AuditPage {
+            events,
+            next_after_seq,
+        })
+    }
+
+    /// Hash of workspace event `seq`; zeros for seq 0. `None` when missing.
+    async fn hash_at(&self, workspace_id: Uuid, seq: u64) -> Result<Option<[u8; 32]>, ApiError> {
+        if seq == 0 {
+            return Ok(Some([0u8; 32]));
+        }
+        Ok(self
+            .store
+            .audit_event(workspace_id, seq)
+            .await?
+            .map(|event| event.hash))
     }
 
     /// Retry a KEK rewrap. A second call wraps nothing and leaves payload bytes alone.
@@ -1358,11 +1645,7 @@ impl Gateway {
     }
 
     async fn authenticate_workspace(&self, credential: &str) -> Result<WorkspaceRow, ApiError> {
-        let raw = crate::b64::b64url_decode(credential)?;
-        if raw.len() != 32 {
-            return Err(ApiError::Unauthenticated);
-        }
-        let hash = sha256(&raw);
+        let hash = credential_hash(credential)?;
         self.store.workspace_by_hash(&hash).await
     }
 
@@ -1388,8 +1671,12 @@ impl Gateway {
         let mut count = 0u32;
         for status in ["active", "deleting", "shredded"] {
             for workspace in self.store.workspaces_with_status(status).await? {
-                if self.publish_one(workspace.id, force).await? {
-                    count += 1;
+                match self.publish_one(workspace.id, force).await {
+                    Ok(true) => count += 1,
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!(workspace_id = %workspace.id, error = %err, "audit checkpoint skipped");
+                    }
                 }
             }
         }
@@ -1408,7 +1695,62 @@ impl Gateway {
         Ok(())
     }
 
+    /// Check, once per workspace per process, that the newest anchored tip
+    /// is signed by this gateway and still matches the stored chain. A
+    /// mismatch is remembered, counted, audited, and refused with
+    /// `AuditAnchorUnavailable` until restart. Runs before a new checkpoint
+    /// so a rewritten chain is never re-anchored.
+    async fn verify_anchor_once(&self, workspace_id: Uuid) -> Result<(), ApiError> {
+        let known = self
+            .anchor_checked
+            .lock()
+            .expect("anchor lock")
+            .get(&workspace_id)
+            .copied();
+        match known {
+            Some(true) => return Ok(()),
+            Some(false) => return Err(ApiError::AuditAnchorUnavailable),
+            None => {}
+        }
+        let Some(tip) = self
+            .anchor
+            .latest(workspace_id)
+            .await
+            .map_err(|_| ApiError::AuditAnchorUnavailable)?
+        else {
+            self.anchor_checked
+                .lock()
+                .expect("anchor lock")
+                .insert(workspace_id, true);
+            return Ok(());
+        };
+        let message = checkpoint_message(workspace_id, tip.seq, &tip.tip_hash);
+        let signed = self.signer.verify_message(&message, &tip.signature);
+        let stored = self.hash_at(workspace_id, tip.seq).await?;
+        let intact = signed && tip.seq > 0 && stored == Some(tip.tip_hash);
+        self.anchor_checked
+            .lock()
+            .expect("anchor lock")
+            .insert(workspace_id, intact);
+        if intact {
+            return Ok(());
+        }
+        self.metrics_integrity.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(%workspace_id, "anchored audit tip does not match the store");
+        let _ = self
+            .store
+            .append_audit(self.audit(
+                workspace_id,
+                None,
+                "audit.anchor.mismatch",
+                vec![("anchored_seq".into(), AuditValue::U64(tip.seq))],
+            ))
+            .await;
+        Err(ApiError::AuditAnchorUnavailable)
+    }
+
     async fn publish_one(&self, workspace_id: Uuid, force: bool) -> Result<bool, ApiError> {
+        self.verify_anchor_once(workspace_id).await?;
         let Some((seq, tip_hash)) = self.store.audit_tip(workspace_id).await? else {
             return Ok(false);
         };
@@ -1560,6 +1902,17 @@ impl Gateway {
             .map(|_| ())
     }
 
+    /// `secret.access.denied` with one reason. Fails closed like its neighbours.
+    async fn deny(&self, workspace_id: Uuid, agent_id: Uuid, reason: &str) -> Result<(), ApiError> {
+        self.audit_or_fail(
+            workspace_id,
+            Some(agent_id),
+            "secret.access.denied",
+            vec![("reason".into(), AuditValue::String(reason.to_owned()))],
+        )
+        .await
+    }
+
     pub async fn purge_dpop(&self) -> Result<(), ApiError> {
         self.store.purge_dpop(self.clock.unix_secs()).await
     }
@@ -1604,6 +1957,172 @@ fn access_fields(
         fields.push(("upstream_host".into(), AuditValue::String(host.to_owned())));
     }
     fields
+}
+
+/// The policy fields one delivery mode needs.
+enum DeliveryTarget {
+    Header { name: String, format: String },
+    Env { name: String },
+}
+
+/// `None` when the policy lacks a field the delivery needs.
+fn delivery_target(policy: &DeliveryPolicy, delivery: Delivery) -> Option<DeliveryTarget> {
+    match delivery {
+        Delivery::Proxy | Delivery::Header => {
+            let name = policy.header_name.clone().filter(|name| !name.is_empty())?;
+            let format = policy
+                .header_format
+                .clone()
+                .filter(|format| !format.is_empty())?;
+            Some(DeliveryTarget::Header { name, format })
+        }
+        Delivery::Env => {
+            let name = policy.env_name.clone().filter(|name| !name.is_empty())?;
+            Some(DeliveryTarget::Env { name })
+        }
+    }
+}
+
+/// True when the URL's authority is a bare host: no userinfo and no written
+/// port, not even `:443`. The URL parser drops a default port, so this looks
+/// at the text. The customer injector refuses both forms.
+fn plain_authority(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    !authority.is_empty() && !authority.contains(['@', ':', '[', ']'])
+}
+
+/// True when `needle` occurs in `haystack`. Needles shorter than
+/// `MIN_REFLECTION_LEN` are skipped to avoid false positives.
+fn reflects(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.len() < MIN_REFLECTION_LEN || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+struct GrantInput<'a> {
+    issuer: &'a str,
+    kid: &'a str,
+    workspace_id: Uuid,
+    agent_id: Option<Uuid>,
+    secret: &'a SecretRow,
+    version: &'a VersionRow,
+    workspace_key_id: Uuid,
+    request: &'a InjectRequest,
+    host: Option<&'a str>,
+    target: &'a DeliveryTarget,
+    iat: u64,
+}
+
+/// The release grant as UTF-8 JSON bytes. The signature covers
+/// `GRANT_PREFIX || these bytes` exactly, so the verifier must check the
+/// bytes it received, not a re-serialisation.
+///
+/// Fields: `v`, `iss`, `kid`, `workspace_id`, `secret_id`, `version_id`,
+/// `workspace_key_id`, `agent_id` (or null), `secret_name`, `delivery`,
+/// `iat`, `exp` (iat + 60), `ciphertext_sha256`; for proxy also `method`,
+/// `url`, `host`, `body_sha256`, `content_type` (or null), `header_name`,
+/// `header_format`; for header `header_name`, `header_format`; for env
+/// `env_name`. Hashes are lowercase hex SHA-256.
+fn build_grant(input: &GrantInput<'_>) -> Result<Vec<u8>, ApiError> {
+    use serde_json::{Map, Value};
+    let mut grant = Map::new();
+    grant.insert("v".into(), Value::from(1u64));
+    grant.insert("iss".into(), Value::from(input.issuer));
+    grant.insert("kid".into(), Value::from(input.kid));
+    grant.insert(
+        "workspace_id".into(),
+        Value::from(input.workspace_id.to_string()),
+    );
+    grant.insert("secret_id".into(), Value::from(input.secret.id.to_string()));
+    grant.insert(
+        "version_id".into(),
+        Value::from(input.version.id.to_string()),
+    );
+    grant.insert(
+        "workspace_key_id".into(),
+        Value::from(input.workspace_key_id.to_string()),
+    );
+    grant.insert(
+        "agent_id".into(),
+        input
+            .agent_id
+            .map_or(Value::Null, |id| Value::from(id.to_string())),
+    );
+    grant.insert(
+        "secret_name".into(),
+        Value::from(input.secret.name.as_str()),
+    );
+    grant.insert(
+        "delivery".into(),
+        Value::from(input.request.delivery.as_str()),
+    );
+    grant.insert("iat".into(), Value::from(input.iat));
+    grant.insert(
+        "exp".into(),
+        Value::from(input.iat.saturating_add(GRANT_TTL_SECS)),
+    );
+    grant.insert(
+        "ciphertext_sha256".into(),
+        Value::from(hex_lower(&sha256(&input.version.sealed.payload_ciphertext))),
+    );
+    match (input.request.delivery, input.target) {
+        (Delivery::Proxy, DeliveryTarget::Header { name, format }) => {
+            let host = input.host.ok_or(ApiError::Forbidden)?;
+            grant.insert("method".into(), Value::from(input.request.method.as_str()));
+            grant.insert("url".into(), Value::from(input.request.url.as_str()));
+            grant.insert("host".into(), Value::from(host));
+            grant.insert(
+                "body_sha256".into(),
+                Value::from(hex_lower(&sha256(&input.request.body))),
+            );
+            grant.insert(
+                "content_type".into(),
+                input
+                    .request
+                    .content_type
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .map_or(Value::Null, Value::from),
+            );
+            grant.insert("header_name".into(), Value::from(name.as_str()));
+            grant.insert("header_format".into(), Value::from(format.as_str()));
+        }
+        (Delivery::Header, DeliveryTarget::Header { name, format }) => {
+            grant.insert("header_name".into(), Value::from(name.as_str()));
+            grant.insert("header_format".into(), Value::from(format.as_str()));
+        }
+        (Delivery::Env, DeliveryTarget::Env { name }) => {
+            grant.insert("env_name".into(), Value::from(name.as_str()));
+        }
+        _ => return Err(ApiError::Forbidden),
+    }
+    serde_json::to_vec(&Value::Object(grant)).map_err(|_| ApiError::BadRequest)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// SHA-256 of a decoded workspace credential. Anything but 32 bytes is refused.
+fn credential_hash(credential: &str) -> Result<[u8; 32], ApiError> {
+    let raw = ZeroizingBuf::new(crate::b64::b64url_decode(credential)?);
+    if raw.len() != 32 {
+        return Err(ApiError::Unauthenticated);
+    }
+    Ok(sha256(&raw))
 }
 
 fn random_32() -> Result<[u8; 32], ApiError> {

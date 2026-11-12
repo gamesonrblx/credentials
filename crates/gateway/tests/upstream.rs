@@ -61,6 +61,84 @@ async fn https_overwrites_the_header_and_does_not_follow_redirects() {
     assert_eq!(hits.load(Ordering::Relaxed), 2);
 }
 
+#[tokio::test]
+async fn trace_is_refused_before_a_connection() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let addr = serve(hits.clone(), seen).await;
+    let upstream = HttpUpstream::new_insecure().unwrap();
+    let mut request = outbound(&format!("https://{addr}/ok"), "Authorization", "Bearer x");
+    request.method = "TRACE".into();
+    let Err(err) = upstream.forward(request).await else {
+        panic!("TRACE was sent");
+    };
+    assert_eq!(err.code(), "forbidden");
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn content_type_is_sent_and_header_injection_is_refused() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let addr = serve(hits.clone(), seen.clone()).await;
+    let upstream = HttpUpstream::new_insecure().unwrap();
+    let mut request = outbound(&format!("https://{addr}/ok"), "Authorization", "Bearer x");
+    request.content_type = Some("application/json".into());
+    upstream.forward(request).await.unwrap();
+    assert!(seen
+        .lock()
+        .await
+        .to_ascii_lowercase()
+        .contains("content-type: application/json"));
+
+    let mut request = outbound(&format!("https://{addr}/ok"), "Authorization", "Bearer x");
+    request.content_type = Some("text/plain\r\nX-Evil: 1".into());
+    assert!(upstream.forward(request).await.is_err());
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn oversized_responses_are_cut_off() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let addr = serve(hits.clone(), seen).await;
+    let upstream = HttpUpstream::new_insecure().unwrap();
+    for path in ["/big-declared", "/big-streamed"] {
+        let Err(err) = upstream
+            .forward(outbound(
+                &format!("https://{addr}{path}"),
+                "Authorization",
+                "Bearer x",
+            ))
+            .await
+        else {
+            panic!("{path} was buffered");
+        };
+        assert_eq!(err.code(), "upstream_failed");
+    }
+}
+
+#[tokio::test]
+async fn real_client_refuses_loopback_by_name_and_by_literal() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let addr = serve(hits.clone(), seen).await;
+    let upstream = HttpUpstream::new().unwrap();
+    for url in [
+        format!("https://localhost:{}/ok", addr.port()),
+        format!("https://{addr}/ok"),
+    ] {
+        let Err(err) = upstream
+            .forward(outbound(&url, "Authorization", "Bearer x"))
+            .await
+        else {
+            panic!("{url} was reached");
+        };
+        assert_eq!(err.code(), "upstream_failed");
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+}
+
 fn outbound(url: &str, name: &str, value: &str) -> Outbound {
     Outbound {
         method: "POST".into(),
@@ -68,6 +146,7 @@ fn outbound(url: &str, name: &str, value: &str) -> Outbound {
         body: Vec::new(),
         header_name: name.into(),
         header_value: value.into(),
+        content_type: None,
     }
 }
 
@@ -106,6 +185,24 @@ async fn serve(
                 let text = String::from_utf8_lossy(&buf[..n]).to_string();
                 hits.fetch_add(1, Ordering::Relaxed);
                 *seen.lock().await = text.clone();
+                if text.contains("/big-declared") || text.contains("/big-streamed") {
+                    let head = if text.contains("/big-declared") {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 9437184\r\nConnection: close\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"
+                    };
+                    if tls.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let chunk = vec![b'x'; 64 * 1024];
+                    for _ in 0..144 {
+                        if tls.write_all(&chunk).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tls.shutdown().await;
+                    return;
+                }
                 let body = if text.contains("GET /redir") || text.contains("POST /redir") {
                     "HTTP/1.1 302 Found\r\nLocation: https://evil.example/steal\r\nContent-Length: 4\r\nConnection: close\r\n\r\nstay"
                 } else {

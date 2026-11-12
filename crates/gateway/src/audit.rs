@@ -169,6 +169,67 @@ pub fn verify_chain(events: &[AuditRecord]) -> bool {
     true
 }
 
+/// Check a contiguous page of workspace events. `prev` is the hash of event
+/// `after_seq` (zeros when `after_seq` is 0). Each event must hash to its
+/// stored values and link to the one before it. Agent links that cross the
+/// page edge are covered by the workspace hash, not checked one by one.
+pub fn verify_window(prev: [u8; 32], after_seq: u64, events: &[AuditRecord]) -> bool {
+    let mut prev = prev;
+    let mut expected_seq = after_seq;
+    for event in events {
+        let Some(next) = expected_seq.checked_add(1) else {
+            return false;
+        };
+        expected_seq = next;
+        if event.seq != expected_seq || event.prev_hash != prev || !hashes_match(event) {
+            return false;
+        }
+        prev = event.hash;
+    }
+    true
+}
+
+/// Check one agent's events in `seq` order. Each event must hash to its
+/// stored values, and each agent link must point at the event before it.
+/// The caller checks that the first event links into the workspace chain.
+pub fn verify_agent_window(events: &[AuditRecord]) -> bool {
+    let mut previous: Option<&AuditRecord> = None;
+    for event in events {
+        if event.agent_id.is_none() || !hashes_match(event) {
+            return false;
+        }
+        match previous {
+            Some(before) => {
+                if event.agent_id != before.agent_id
+                    || event.seq <= before.seq
+                    || Some(event.agent_prev_hash) != before.agent_hash
+                    || before.agent_seq.checked_add(1) != Some(event.agent_seq)
+                {
+                    return false;
+                }
+            }
+            None => {
+                if event.agent_seq == 1 && event.agent_prev_hash != [0u8; 32] {
+                    return false;
+                }
+            }
+        }
+        previous = Some(event);
+    }
+    true
+}
+
+fn hashes_match(event: &AuditRecord) -> bool {
+    let body = canonical_body(event);
+    if workspace_hash(&event.prev_hash, &body) != event.hash {
+        return false;
+    }
+    match event.agent_id {
+        Some(_) => event.agent_hash == Some(agent_hash(&body)),
+        None => event.agent_hash.is_none(),
+    }
+}
+
 fn push_str_u16(out: &mut Vec<u8>, text: &str) {
     let len = u16::try_from(text.len()).unwrap_or(u16::MAX);
     out.extend_from_slice(&len.to_be_bytes());
@@ -212,6 +273,45 @@ mod tests {
         let mut tampered = second.clone();
         tampered.event_type = "secret.access.denied".to_owned();
         assert!(!verify_chain(&[first, tampered]));
+    }
+
+    #[test]
+    fn a_page_verifies_against_the_event_before_it() {
+        let workspace = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let first = sample(workspace, Some(agent), 1, 1, [0u8; 32], [0u8; 32], "a");
+        let second = sample(
+            workspace,
+            Some(agent),
+            2,
+            2,
+            first.hash,
+            first.agent_hash.unwrap(),
+            "b",
+        );
+        let third = sample(
+            workspace,
+            Some(agent),
+            3,
+            3,
+            second.hash,
+            second.agent_hash.unwrap(),
+            "c",
+        );
+        let page = [second.clone(), third.clone()];
+        assert!(verify_window(first.hash, 1, &page));
+        assert!(!verify_window([0u8; 32], 1, &page));
+        assert!(!verify_window(first.hash, 0, &page));
+        assert!(!verify_window(first.hash, 1, std::slice::from_ref(&third)));
+        assert!(verify_agent_window(&page));
+        let mut tampered = third;
+        tampered.event_type = "d".to_owned();
+        assert!(!verify_window(
+            first.hash,
+            1,
+            &[second.clone(), tampered.clone()]
+        ));
+        assert!(!verify_agent_window(&[second, tampered]));
     }
 
     fn sample(

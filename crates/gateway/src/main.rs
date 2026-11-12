@@ -9,6 +9,11 @@
 //! starts the control plane instead: no dev key file, no dev signer, and
 //! no dev audit anchor. That process cannot unwrap secrets.
 //!
+//! Production also requires `CREDENTIALS_PUBLIC_URL` (the https origin DPoP
+//! proofs are bound to) and a Postgres URL that enforces TLS unless
+//! `CREDENTIALS_ALLOW_PLAINTEXT_DB=1`. A non-loopback listener needs an
+//! operator token of at least 16 characters.
+//!
 //! Workspace creation on this listener is unauthenticated so a local process
 //! can bootstrap. Do not expose the port beyond loopback.
 
@@ -27,9 +32,13 @@ async fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .fmt_fields(credentials_gateway::redacting_fields())
         .init();
 
-    let policy = DevPolicy::from_env();
+    let policy = DevPolicy::from_env().unwrap_or_else(|err| {
+        eprintln!("{err}");
+        std::process::exit(1);
+    });
     let mut gateway = if policy.allow_dev {
         build_dev(policy).await
     } else {
@@ -41,6 +50,25 @@ async fn main() {
     if let Ok(audience) = std::env::var("CREDENTIALS_AUDIENCE") {
         gateway.set_audience(audience);
     }
+    match std::env::var("CREDENTIALS_PUBLIC_URL") {
+        Ok(raw) => match public_origin(&raw, policy.allow_dev) {
+            Ok(origin) => gateway.set_public_origin(Some(origin)),
+            Err(err) => {
+                eprintln!("CREDENTIALS_PUBLIC_URL: {err}");
+                std::process::exit(1);
+            }
+        },
+        Err(_) if !policy.allow_dev => {
+            eprintln!(
+                "CREDENTIALS_PUBLIC_URL is required in production (for example \
+                 https://secrets.example.com). DPoP proofs are bound to it instead of the \
+                 client-supplied Host header"
+            );
+            std::process::exit(1);
+        }
+        Err(_) => {}
+    }
+    let public_url = gateway.public_origin().map(str::to_owned);
     let gateway = Arc::new(gateway);
 
     let addr: SocketAddr = std::env::var("CREDENTIALS_LISTEN")
@@ -51,9 +79,11 @@ async fn main() {
             std::process::exit(1);
         });
     let operator_token = std::env::var("CREDENTIALS_OPERATOR_TOKEN").ok();
-    if !addr.ip().is_loopback() && operator_token.is_none() {
-        eprintln!("CREDENTIALS_OPERATOR_TOKEN is required when the listener is not loopback");
-        std::process::exit(1);
+    if !addr.ip().is_loopback() {
+        if let Err(err) = check_operator_token(operator_token.as_deref()) {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
     }
 
     let poller = Arc::clone(&gateway);
@@ -104,6 +134,8 @@ async fn main() {
         eprintln!("TLS_REQUIRE_HYBRID is on. Set CREDENTIALS_TLS_CERT and CREDENTIALS_TLS_KEY");
         std::process::exit(1);
     }
+    let tls = cert_path.is_some() && key_path.is_some();
+    let login = oidc_login(addr, tls, public_url.as_deref());
     if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
         let certs = match load_certs(&cert_path) {
             Ok(certs) => certs,
@@ -119,13 +151,17 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        let Some(cert) = certs.into_iter().next() else {
-            eprintln!("tls cert file is empty");
-            std::process::exit(1);
-        };
-        if let Err(err) =
-            credentials_gateway::serve_tls(gateway, addr, operator_token, cert, key, require_hybrid)
-                .await
+        // The whole chain is served: leaf first, then intermediates.
+        if let Err(err) = credentials_gateway::serve_tls(
+            gateway,
+            addr,
+            operator_token,
+            certs,
+            key,
+            require_hybrid,
+            login,
+        )
+        .await
         {
             eprintln!("tls server: {err}");
             std::process::exit(1);
@@ -133,7 +169,7 @@ async fn main() {
         return;
     }
 
-    if let Some(login) = oidc_login(addr) {
+    if let Some(login) = login {
         let app = credentials_gateway::router_with_login(gateway, operator_token, login);
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => listener,
@@ -155,16 +191,70 @@ async fn main() {
     }
 }
 
-fn oidc_login(addr: std::net::SocketAddr) -> Option<std::sync::Arc<credentials_gateway::LoginHub>> {
+/// Dashboard login, when `CREDENTIALS_OIDC_ISSUER` is set. The default
+/// redirect uses the public URL, or the listener address and scheme.
+fn oidc_login(
+    addr: std::net::SocketAddr,
+    tls: bool,
+    public_url: Option<&str>,
+) -> Option<std::sync::Arc<credentials_gateway::LoginHub>> {
     let issuer = std::env::var("CREDENTIALS_OIDC_ISSUER").ok()?;
     let client_id =
         std::env::var("CREDENTIALS_OIDC_CLIENT_ID").unwrap_or_else(|_| "credentials".into());
     let secret = std::env::var("CREDENTIALS_OIDC_CLIENT_SECRET").ok();
-    let redirect = std::env::var("CREDENTIALS_OIDC_REDIRECT")
-        .unwrap_or_else(|_| format!("http://{addr}/v1/login/callback"));
+    let redirect =
+        std::env::var("CREDENTIALS_OIDC_REDIRECT").unwrap_or_else(|_| match public_url {
+            Some(origin) => format!("{origin}/v1/login/callback"),
+            None => {
+                let scheme = if tls { "https" } else { "http" };
+                format!("{scheme}://{addr}/v1/login/callback")
+            }
+        });
     Some(std::sync::Arc::new(credentials_gateway::LoginHub::new(
         issuer, client_id, redirect, secret,
     )))
+}
+
+/// Normalise `CREDENTIALS_PUBLIC_URL` to an origin such as
+/// `https://secrets.example.com`. Plain `http` is accepted only in dev.
+fn public_origin(raw: &str, allow_http: bool) -> Result<String, String> {
+    let url = url::Url::parse(raw.trim()).map_err(|_| "not a valid URL".to_string())?;
+    match url.scheme() {
+        "https" => {}
+        "http" if allow_http => {}
+        "http" => return Err("must use https outside dev".into()),
+        _ => return Err("scheme must be https".into()),
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err("a host is required".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("must not contain credentials".into());
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err("must be an origin with no path, query or fragment".into());
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+/// A non-loopback listener needs a real operator token.
+fn check_operator_token(token: Option<&str>) -> Result<(), &'static str> {
+    match token {
+        None => Err("CREDENTIALS_OPERATOR_TOKEN is required when the listener is not loopback"),
+        Some("change-me") => Err("CREDENTIALS_OPERATOR_TOKEN is still the example value change-me"),
+        Some(token) if token.chars().count() < MIN_OPERATOR_TOKEN_CHARS => Err(
+            "CREDENTIALS_OPERATOR_TOKEN must be at least 16 characters when the listener is not loopback",
+        ),
+        Some(_) => Ok(()),
+    }
+}
+
+const MIN_OPERATOR_TOKEN_CHARS: usize = 16;
+
+/// True for a `postgres://` or `postgresql://` URL.
+fn is_postgres_url(url: &str) -> bool {
+    let lower = url.trim_start().to_ascii_lowercase();
+    lower.starts_with("postgres://") || lower.starts_with("postgresql://")
 }
 
 fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
@@ -287,6 +377,17 @@ async fn build_production(policy: DevPolicy) -> Gateway {
         eprintln!("CREDENTIALS_DATABASE_URL is required in production");
         std::process::exit(1);
     };
+    if is_postgres_url(&database_url)
+        && !SqlStore::postgres_url_enforces_tls(&database_url)
+        && std::env::var("CREDENTIALS_ALLOW_PLAINTEXT_DB").as_deref() != Ok("1")
+    {
+        eprintln!(
+            "CREDENTIALS_DATABASE_URL does not enforce TLS (set sslmode=require, verify-ca or \
+             verify-full). Ciphertext, audit rows and tokens would cross the network in clear. \
+             Set CREDENTIALS_ALLOW_PLAINTEXT_DB=1 only for a database on a private host network"
+        );
+        std::process::exit(1);
+    }
     let signer = match DevSigner::load_production(std::path::Path::new(&signer_path), policy) {
         Ok(signer) => signer,
         Err(err) => {
@@ -335,4 +436,55 @@ fn upstream() -> Arc<HttpUpstream> {
         eprintln!("upstream client: {err}");
         std::process::exit(1);
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_url_is_normalised_to_an_origin() {
+        assert_eq!(
+            public_origin("https://Secrets.Example.com/", false).unwrap(),
+            "https://secrets.example.com"
+        );
+        assert_eq!(
+            public_origin("https://secrets.example.com:8443", false).unwrap(),
+            "https://secrets.example.com:8443"
+        );
+        assert_eq!(
+            public_origin("https://secrets.example.com:443", false).unwrap(),
+            "https://secrets.example.com"
+        );
+        assert_eq!(
+            public_origin("http://127.0.0.1:8080", true).unwrap(),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn public_url_rejects_http_in_production_and_extra_parts() {
+        assert!(public_origin("http://secrets.example.com", false).is_err());
+        assert!(public_origin("ftp://secrets.example.com", true).is_err());
+        assert!(public_origin("https://secrets.example.com/v1", false).is_err());
+        assert!(public_origin("https://secrets.example.com/?a=b", false).is_err());
+        assert!(public_origin("https://secrets.example.com/#x", false).is_err());
+        assert!(public_origin("https://user:pw@secrets.example.com", false).is_err());
+        assert!(public_origin("secrets.example.com", false).is_err());
+    }
+
+    #[test]
+    fn weak_operator_tokens_are_refused() {
+        assert!(check_operator_token(None).is_err());
+        assert!(check_operator_token(Some("change-me")).is_err());
+        assert!(check_operator_token(Some("short-token")).is_err());
+        assert!(check_operator_token(Some("a-long-random-operator-token")).is_ok());
+    }
+
+    #[test]
+    fn postgres_urls_are_recognised() {
+        assert!(is_postgres_url("postgres://u:p@db/x"));
+        assert!(is_postgres_url("postgresql://u:p@db/x"));
+        assert!(!is_postgres_url("sqlite://file.db"));
+    }
 }

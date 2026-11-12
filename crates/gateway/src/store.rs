@@ -109,6 +109,9 @@ pub struct WorkspaceRow {
     pub kms_key_ref: String,
     pub credential_hash: [u8; 32],
     pub audit_seq: u64,
+    /// Unix seconds after which a `deleting` workspace is shredded. `None`
+    /// while the workspace is active.
+    pub delete_after: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -178,6 +181,28 @@ pub trait Store: Send + Sync {
     async fn workspace_by_hash(&self, hash: &[u8; 32]) -> Result<WorkspaceRow, ApiError>;
     async fn workspace(&self, id: Uuid) -> Result<WorkspaceRow, ApiError>;
     async fn set_workspace_status(&self, id: Uuid, status: &str) -> Result<(), ApiError>;
+    /// Move an `active` workspace to `deleting` with its shred deadline in one
+    /// write. A workspace in any other state is left alone and the call
+    /// returns `WorkspaceDeleting`.
+    async fn schedule_workspace_deletion(
+        &self,
+        id: Uuid,
+        delete_after: u64,
+    ) -> Result<(), ApiError>;
+    /// Move a `deleting` workspace back to `active` and clear the deadline.
+    /// Any other state returns `BadRequest`.
+    async fn cancel_workspace_deletion(&self, id: Uuid) -> Result<(), ApiError>;
+    /// Revoke the presented credential hash and store a new one, with the
+    /// audit event, in one transaction. An unknown or revoked `old_hash`
+    /// returns `Unauthenticated`.
+    async fn rotate_workspace_credential(
+        &self,
+        workspace_id: Uuid,
+        old_hash: &[u8; 32],
+        new_hash: [u8; 32],
+        at: u64,
+        audit: AuditDraft,
+    ) -> Result<(), ApiError>;
     async fn insert_kek(&self, kek: KekRow) -> Result<(), ApiError>;
     /// Retire the current active KEK and insert the next active row in one step.
     /// A partial unique index allows only one active KEK, so the two writes
@@ -220,6 +245,21 @@ pub trait Store: Send + Sync {
         workspace_id: Uuid,
         agent_id: Uuid,
     ) -> Result<Vec<AuditRecord>, ApiError>;
+    /// Up to `limit` events with `seq > after_seq`, in `seq` order. With an
+    /// agent, only that agent's events.
+    async fn audit_page(
+        &self,
+        workspace_id: Uuid,
+        agent_id: Option<Uuid>,
+        after_seq: u64,
+        limit: u32,
+    ) -> Result<Vec<AuditRecord>, ApiError>;
+    /// One workspace event by `seq`.
+    async fn audit_event(
+        &self,
+        workspace_id: Uuid,
+        seq: u64,
+    ) -> Result<Option<AuditRecord>, ApiError>;
     async fn revoke_workspace_sessions(&self, workspace_id: Uuid, at: u64) -> Result<(), ApiError>;
     async fn revoke_workspace_credentials(
         &self,
@@ -254,6 +294,8 @@ pub trait Store: Send + Sync {
         expires_at: u64,
     ) -> Result<(), ApiError>;
     async fn jti_is_revoked(&self, jti: Uuid, now: u64) -> Result<bool, ApiError>;
+    /// Record a DPoP `jti` for one workspace. A repeat of the same
+    /// (workspace, jti) pair returns `Unauthenticated`.
     async fn claim_dpop_jti(
         &self,
         jti: &str,
@@ -318,7 +360,7 @@ struct State {
     workspace_keys: HashMap<Uuid, WorkspaceKeyRow>,
     recipients: HashMap<Uuid, RecipientRow>,
     revoked_jtis: HashMap<Uuid, (Uuid, u64)>,
-    dpop_replay: HashMap<String, (Uuid, u64)>,
+    dpop_replay: HashMap<(Uuid, String), u64>,
     rewrap_jobs: HashMap<Uuid, RewrapJobRow>,
 }
 
@@ -380,6 +422,58 @@ impl Store for MemoryStore {
         let row = state.workspaces.get_mut(&id).ok_or(ApiError::NotFound)?;
         row.status = status.to_owned();
         Ok(())
+    }
+
+    async fn schedule_workspace_deletion(
+        &self,
+        id: Uuid,
+        delete_after: u64,
+    ) -> Result<(), ApiError> {
+        let mut state = lock(&self.inner);
+        let row = state.workspaces.get_mut(&id).ok_or(ApiError::NotFound)?;
+        if row.status != "active" {
+            return Err(ApiError::WorkspaceDeleting);
+        }
+        row.status = "deleting".to_owned();
+        row.delete_after = Some(delete_after);
+        Ok(())
+    }
+
+    async fn cancel_workspace_deletion(&self, id: Uuid) -> Result<(), ApiError> {
+        let mut state = lock(&self.inner);
+        let row = state.workspaces.get_mut(&id).ok_or(ApiError::NotFound)?;
+        if row.status != "deleting" {
+            return Err(ApiError::BadRequest);
+        }
+        row.status = "active".to_owned();
+        row.delete_after = None;
+        Ok(())
+    }
+
+    async fn rotate_workspace_credential(
+        &self,
+        workspace_id: Uuid,
+        old_hash: &[u8; 32],
+        new_hash: [u8; 32],
+        _at: u64,
+        audit: AuditDraft,
+    ) -> Result<(), ApiError> {
+        let fail = self.fail_appends.load(Ordering::Relaxed);
+        self.write_checked(|state| {
+            if state.by_hash.get(old_hash) != Some(&workspace_id) {
+                return Err(ApiError::Unauthenticated);
+            }
+            if state.by_hash.contains_key(&new_hash) {
+                return Err(ApiError::BadRequest);
+            }
+            append_locked(state, audit, fail)?;
+            state.by_hash.remove(old_hash);
+            state.by_hash.insert(new_hash, workspace_id);
+            if let Some(row) = state.workspaces.get_mut(&workspace_id) {
+                row.credential_hash = new_hash;
+            }
+            Ok(())
+        })
     }
 
     async fn insert_kek(&self, kek: KekRow) -> Result<(), ApiError> {
@@ -606,6 +700,40 @@ impl Store for MemoryStore {
             .collect())
     }
 
+    async fn audit_page(
+        &self,
+        workspace_id: Uuid,
+        agent_id: Option<Uuid>,
+        after_seq: u64,
+        limit: u32,
+    ) -> Result<Vec<AuditRecord>, ApiError> {
+        let mut events: Vec<AuditRecord> = lock(&self.inner)
+            .audits
+            .iter()
+            .filter(|event| {
+                event.workspace_id == workspace_id
+                    && event.seq > after_seq
+                    && agent_id.is_none_or(|agent| event.agent_id == Some(agent))
+            })
+            .cloned()
+            .collect();
+        events.sort_by_key(|event| event.seq);
+        events.truncate(limit as usize);
+        Ok(events)
+    }
+
+    async fn audit_event(
+        &self,
+        workspace_id: Uuid,
+        seq: u64,
+    ) -> Result<Option<AuditRecord>, ApiError> {
+        Ok(lock(&self.inner)
+            .audits
+            .iter()
+            .find(|event| event.workspace_id == workspace_id && event.seq == seq)
+            .cloned())
+    }
+
     async fn revoke_workspace_sessions(&self, workspace_id: Uuid, at: u64) -> Result<(), ApiError> {
         let mut state = lock(&self.inner);
         let jtis: Vec<(Uuid, u64)> = state
@@ -811,20 +939,17 @@ impl Store for MemoryStore {
         let mut state = lock(&self.inner);
         state
             .dpop_replay
-            .retain(|_, (_, exp)| *exp > expires_at.saturating_sub(900));
-        if state.dpop_replay.contains_key(jti) {
+            .retain(|_, exp| *exp > expires_at.saturating_sub(900));
+        let key = (workspace_id, jti.to_owned());
+        if state.dpop_replay.contains_key(&key) {
             return Err(ApiError::Unauthenticated);
         }
-        state
-            .dpop_replay
-            .insert(jti.to_owned(), (workspace_id, expires_at));
+        state.dpop_replay.insert(key, expires_at);
         Ok(())
     }
 
     async fn purge_dpop(&self, now: u64) -> Result<(), ApiError> {
-        lock(&self.inner)
-            .dpop_replay
-            .retain(|_, (_, exp)| *exp > now);
+        lock(&self.inner).dpop_replay.retain(|_, exp| *exp > now);
         Ok(())
     }
 

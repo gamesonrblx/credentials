@@ -23,6 +23,29 @@ pub fn redact_field(key: &str) -> bool {
     REDACTED.iter().any(|name| key.eq_ignore_ascii_case(name))
 }
 
+/// Field formatter for `tracing_subscriber::fmt().fmt_fields(..)`. A field
+/// whose name [`redact_field`] matches is written as `[redacted]`.
+pub fn redacting_fields(
+) -> impl for<'writer> tracing_subscriber::fmt::FormatFields<'writer> + 'static {
+    use tracing_subscriber::field::MakeExt;
+    tracing_subscriber::fmt::format::debug_fn(write_field).delimited(" ")
+}
+
+fn write_field(
+    writer: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    field: &tracing::field::Field,
+    value: &dyn std::fmt::Debug,
+) -> std::fmt::Result {
+    let name = field.name();
+    if name == "message" {
+        write!(writer, "{value:?}")
+    } else if redact_field(name) {
+        write!(writer, "{name}=[redacted]")
+    } else {
+        write!(writer, "{name}={value:?}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -93,6 +93,7 @@ async fn round_trip(database_url: &str, dir: &std::path::Path) {
             htm: "POST".into(),
             htu: htu.into(),
             local_channel: false,
+            content_type: None,
         })
         .await
         .unwrap();
