@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use credentials_crypto::{generate_hybrid_keypair, seal_e2e, DevPolicy, VersionIds};
+use credentials_crypto::{
+    generate_hybrid_keypair, seal_e2e, DevPolicy, MemoryRootKeys, VersionIds,
+};
 use credentials_gateway::{
     generate_dpop, Clock, Delivery, DeliveryPolicy, DevFileAnchor, DevSigner, E2eSubmission,
     FileAnchor, Gateway, InjectRequest, MemoryAnchor, MemoryStore, Now, RecordingUpstream,
@@ -134,5 +136,85 @@ async fn production_releases_e2e_and_refuses_to_seal_plaintext() {
         .body
         .windows(b"sk-prod".len())
         .any(|w| w == b"sk-prod"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn control_plane_does_not_open_a_dev_sealed_secret() {
+    let store = Arc::new(MemoryStore::new());
+    let dev = Gateway::new(
+        store.clone(),
+        Arc::new(MemoryRootKeys::new(DevPolicy { allow_dev: true }).unwrap()),
+        Arc::new(RecordingUpstream::new()),
+        Arc::new(Clock),
+    )
+    .unwrap();
+    let created = dev.create_workspace().await.unwrap();
+    dev.create_secret(
+        &created.credential,
+        "prod/openai/api_key",
+        b"sk-smuggled",
+        DeliveryPolicy {
+            header_name: Some("Authorization".into()),
+            header_format: Some("Bearer {value}".into()),
+            env_name: None,
+            hosts: vec!["api.openai.com".into()],
+            allow_proxy: true,
+            allow_header: false,
+            allow_env: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("credentials-smuggle-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let plane = Gateway::control_plane(
+        store,
+        Arc::new(RecordingUpstream::new()),
+        Arc::new(Clock),
+        DevSigner::load_production(&dir.join("signing.json"), DevPolicy { allow_dev: false })
+            .unwrap(),
+        Arc::new(MemoryAnchor::new()),
+        DevPolicy { allow_dev: false },
+    )
+    .unwrap();
+    let dpop = generate_dpop().unwrap();
+    let agent = plane
+        .create_agent(&created.credential, "runner")
+        .await
+        .unwrap();
+    let session = plane
+        .create_session(
+            &created.credential,
+            agent,
+            vec!["secret:inject:prod/openai/api_key".into()],
+            Some(60),
+            dpop.public_b64(),
+        )
+        .await
+        .unwrap();
+    let proof = dpop.proof(
+        "POST",
+        "https://credentials.local/v1/inject",
+        &session.token,
+        Clock.unix_secs(),
+        "smuggle",
+    );
+    let released = plane
+        .inject(InjectRequest {
+            token: session.token,
+            dpop: proof,
+            secret: "prod/openai/api_key".into(),
+            delivery: Delivery::Proxy,
+            method: "POST".into(),
+            url: "https://api.openai.com/v1/chat/completions".into(),
+            body: Vec::new(),
+            htm: "POST".into(),
+            htu: "https://credentials.local/v1/inject".into(),
+            local_channel: false,
+        })
+        .await;
+    assert!(released.is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }

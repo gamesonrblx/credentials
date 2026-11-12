@@ -1486,6 +1486,9 @@ impl Gateway {
         workspace: &WorkspaceRow,
         kek: &KekRow,
     ) -> Result<ZeroizingBuf<[u8; 32]>, ApiError> {
+        if !self.unwrap_secrets {
+            return Err(ApiError::DecryptFailed);
+        }
         if workspace.status != "active" {
             return Err(ApiError::WorkspaceDeleting);
         }

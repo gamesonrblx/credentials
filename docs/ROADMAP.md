@@ -76,7 +76,7 @@ The dashboard HTML does not decrypt a secret.
 - **M3** requires zero-knowledge against the operator for self-host production and for a hosted control plane. The production control plane does not open an e2e secret.
 - **M4** is the first release a third party can self-host. It uses the M3 trust model, real signing keys, and TLS. TLS 1.3 is already in the tree.
 - **M5** is an optional hosted beta of the same public API. Tactico would be the operator. The beta claims no certification. Zero-knowledge is an exit criterion. No hosted mode lets Tactico decrypt a secret. There is no live hosted service.
-- **M6** covers import, human login, and the dashboard. Import HTTP readers are in `credentials-edge`. Default CI does not call the live APIs. SAML is not implemented. The dashboard HTML does not decrypt a secret.
+- **M6** covers import, human login, and the dashboard. Import HTTP readers are in `credentials-edge`. The integration job calls LocalStack, MinIO, Vault, and Dex. Infisical, Doppler, and 1Password stay on local fixtures. SAML is not implemented. The dashboard HTML does not decrypt a secret.
 - **M7** decides the licence and the public name. Zero-knowledge stays in M3.
 
 M6 and M7 do not block the MVP.
@@ -153,7 +153,7 @@ Read the current facts at the top of this file.
 
 These items are still absent.
 There is no live hosted service.
-Default CI does not use S3 Object Lock.
+The integration job puts one compliance-mode object in MinIO. It does not call AWS S3.
 There is no Nitro EIF and no live Nitro path.
 `credentials-edge` verifies a `COSE_Sign1` ES384 document against a caller-pinned root. CI uses a test root. The tree has no Nitro EIF.
 SAML is not implemented.
@@ -508,7 +508,7 @@ There is no live hosted service in this tree.
 - Hosted injection, if it is offered, runs only as architecture (ii) from M3. That is an attested enclave, with key release bound to the measurement. Operator staff and the host cannot unwrap keys. The tree has no live enclave. `credentials-edge` verifies a `COSE_Sign1` ES384 document against a caller-pinned root. CI uses a test root. If the enclave path is not in this beta, callers use `credentials-injector` against the hosted control plane. There is no mode in which a normal Tactico process decrypts.
 - Use a hosted audit anchor with a retention lock.
 - S3 Object Lock or an equivalent meets that rule.
-- Key each object by `{workspace_id}/{seq}`. The publisher can put objects and cannot delete them. The database role has no permission on the bucket. Default CI does not use S3 Object Lock. `credentials-edge` can send an object with compliance-mode headers. Default CI does not start that store.
+- Key each object by `{workspace_id}/{seq}`. The publisher can put objects and cannot delete them. The database role has no permission on the bucket. The integration job puts one compliance-mode object in MinIO. It does not call AWS S3. `credentials-edge` can send an object with compliance-mode headers. The integration job starts MinIO for that check. It does not call AWS S3.
 - Harden multi-tenant operation with rate limits, per-workspace isolation, and request ids in the audit log. Write operator runbooks for fail-closed behavior when attestation or the injector is unavailable. Alert on integrity failure and anchor lag. A KMS outage of a signing key stops token issue and audit signing. Do not hide that outage by unwrapping a secret in the control plane.
 - Keep the section 13 metrics that apply to a control plane that does not decrypt.
 - Those metrics are `crypto_integrity_failure_total` when the injector reports it, `inject_total`, and `token_denied_total`.
@@ -549,7 +549,7 @@ The injector seals it under the customer-held key from M3.
 
 ### Deliverables
 
-- Provide one-time import from Infisical, Doppler, 1Password Connect, HashiCorp Vault KV, and `.env` files. HTTP readers for Infisical, Doppler, 1Password Connect, and Vault KV exist in `credentials-edge`. Default CI does not call those live APIs. The injector reads the source one time, seals each secret as a native version, and discards the source bytes. The control plane receives ciphertext. It does not receive the imported plaintext. It does not keep a live connection that fetches those products at inject time.
+- Provide one-time import from Infisical, Doppler, 1Password Connect, HashiCorp Vault KV, and `.env` files. HTTP readers for Infisical, Doppler, 1Password Connect, and Vault KV exist in `credentials-edge`. The integration job calls Vault KV. Infisical, Doppler, and 1Password stay on local fixtures. The injector reads the source one time, seals each secret as a native version, and discards the source bytes. The control plane receives ciphertext. It does not receive the imported plaintext. It does not keep a live connection that fetches those products at inject time.
 - The import path is not a live backend on the inject path. After import, injection uses only Credentials ciphertext. A failure during import stops that item.
 The failure leaves no plaintext on the control plane.
 The importer operator sees a failed item.
@@ -622,7 +622,7 @@ M3, M4, and M5 require it.
 9. **Hosted injection mechanism.** Architecture (i) is sufficient for the M5 exit criteria. The injector exists. The beta can add architecture (ii) later.
 Choose the first enclave technology at that time.
 Do not add a hosted process that can decrypt. There is no live hosted service and no Nitro EIF. `credentials-edge` verifies a `COSE_Sign1` ES384 document against a caller-pinned root. CI uses a test root.
-10. **Audit retention after shred.** The default is 90 days, as a per-workspace setting, for audit metadata. Does any anticipated contract require immediate deletion of that metadata, including retention-locked anchors? Destruction of client-held keys shreds e2e payloads. Default CI does not use S3 Object Lock.
+10. **Audit retention after shred.** The default is 90 days, as a per-workspace setting, for audit metadata. Does any anticipated contract require immediate deletion of that metadata, including retention-locked anchors? Destruction of client-held keys shreds e2e payloads. The integration job puts one compliance-mode object in MinIO. It does not call AWS S3.
 11. **Second person to approve shred.** For client-held keys, shred is destruction of the decapsulation key and the recovery recipients. Is a two-person rule required for a hosted operator console? The operator already cannot open the secret.
 12. **`reveal` for humans, multi-region, and hybrid token signatures.**
 A human reveal path exists only in the injector or in the attested enclave. Multi-region must not be solved by copying unwrap keys into the control-plane database. Hybrid token signatures stay as in section 14. The dashboard HTML does not decrypt a secret.

@@ -82,7 +82,7 @@ flowchart TB
 | Gateway or injector | **Implemented.** Dev `Gateway::inject` unwraps the workspace KEK, opens a `wrap_mode=gateway` payload, and injects. Proxy is the public delivery mode. `credentials-injector` opens `wrap_mode=e2e`. | The injector is the production opener. An attested enclave is **not a live path**. The operator does not decrypt in production. |
 | Storage | **Implemented.** `SqlStore` uses SQLite for a local run and Postgres for production. `MemoryStore` remains for unit tests. An e2e row stores CRD2 ciphertext. The control plane does not open it. | The production control plane starts with `RejectingRootKeys`. |
 | KMS or HSM | **Implemented** for the dev file and for memory keys. `DevFileRootKeys` writes a raw 32-byte tenant root key to `.credentials-dev-keys.json`. `CREDENTIALS_DEV_KEYS` overrides that path. Unix mode is `0600`. `MemoryRootKeys` holds that key in memory. `CREDENTIALS_ENV=production` rejects both. `credentials-edge` has Vault Transit and AWS KMS adapters. `Gateway::control_plane` does not call them. | Non-exportable signing keys in a cloud KMS are **planned (M4)**. PKCS#11 is later. The production control plane has no `Decrypt` on a key that wraps a secret data key. |
-| Audit log | **Implemented.** Each workspace has a hash chain. Each agent has a chain. The allow event is appended before decrypt. A failed append skips decrypt. The dev process signs the tip into a local `AuditAnchor`. `CREDENTIALS_ENV=production` rejects that dev anchor. A lagged anchor makes inject return 503 before decrypt. | A retention-locked object store is **planned (M5)**. Default CI does not use S3 Object Lock. Section 6 states the limit after the customer holds the key. |
+| Audit log | **Implemented.** Each workspace has a hash chain. Each agent has a chain. The allow event is appended before decrypt. A failed append skips decrypt. The dev process signs the tip into a local `AuditAnchor`. `CREDENTIALS_ENV=production` rejects that dev anchor. A lagged anchor makes inject return 503 before decrypt. | A retention-locked object store is **planned (M5)**. The integration job puts one compliance-mode object in MinIO. It does not call AWS S3. Section 6 states the limit after the customer holds the key. |
 
 Self-host production means the customer runs the control plane and still cannot open a secret from that process.
 The workload owner runs the injector, with the workspace key, in a separate trust domain.
@@ -603,7 +603,7 @@ Decryption stays a property of the workspace key.
 
 **Implemented** for the hash chain, the fail-closed allow, the dev signature, and the dev anchor file.
 A retention-locked hosted bucket is **planned (M5)**.
-Default CI does not use S3 Object Lock.
+The integration job puts one compliance-mode object in MinIO. It does not call AWS S3.
 
 Each workspace has one sequence.
 Each agent also has a chain.
@@ -706,13 +706,13 @@ This document is the map.
 The encryption spec remains normative for the envelope.
 
 - [ENCRYPTION.md](ENCRYPTION.md) names Rust as the implementation language. TLS uses rustls and aws-lc-rs. The Go TLS notes are not a second codebase.
-- Import HTTP readers for Infisical, Doppler, 1Password Connect, and Vault KV exist in `credentials-edge`. Default CI does not call those live APIs. Inject does not fetch those products. The injector seals a native version and discards the source bytes.
+- Import HTTP readers for Infisical, Doppler, 1Password Connect, and Vault KV exist in `credentials-edge`. The integration job calls Vault KV. Infisical, Doppler, and 1Password stay on local fixtures. Inject does not fetch those products. The injector seals a native version and discards the source bytes.
 - The public API is client-agnostic. The in-tree client is `credentials-client`.
 - `wrap_mode` and `e2e_encapsulation` exist. `wrap_mode=e2e` stores CRD2. The production control plane does not open those rows. `credentials-injector` opens them.
 - DPoP `htu` comes from the request host and the TLS flag. The handler does not read `x-dpop-htu`. The migration creates `revoked_jtis`. The gateway code does not read that table yet. A disabled agent, a failed DPoP proof, or a replayed DPoP `jti` returns 401 without an audit row. `secret.access.delivered` and `secret.access.failed` ignore an append error. The allow event does not.
 - Workspace delete revokes sessions, deletes secret rows, and schedules shred. A poller sets `shredded`. Cancel exists while destruction is pending. The migration creates `rewrap_jobs`. KEK rotation rewraps data keys in the gateway process.
 - The public listener rejects `env` and `header`. The local socket (`CREDENTIALS_LOCAL_DIR`, mode `0700`, same-uid peer check) returns `{ env_name, value }` or `{ header_name, value }`. It does not forward header delivery through `Upstream`.
-- `credentials-edge` has Vault Transit, AWS KMS, a WebAuthn software authenticator, and OIDC PKCE helpers. `Gateway::control_plane` does not call the KMS adapters. SAML is not implemented. The dashboard HTML does not decrypt. There is no live hosted service. Default CI does not use S3 Object Lock. There is no Nitro EIF. `credentials-edge` verifies a `COSE_Sign1` ES384 document against a caller-pinned root. CI uses a test root, not a live enclave. PKCS#11 is not in the tree. The production signer is still a `DevSigner` argument on `Gateway::control_plane`.
+- `credentials-edge` has Vault Transit, AWS KMS, a WebAuthn software authenticator, and OIDC PKCE helpers. `Gateway::control_plane` does not call the KMS adapters. SAML is not implemented. The dashboard HTML does not decrypt. There is no live hosted service. The integration job puts one compliance-mode object in MinIO. It does not call AWS S3. There is no Nitro EIF. `credentials-edge` verifies a `COSE_Sign1` ES384 document against a caller-pinned root. CI uses a test root, not a live enclave. PKCS#11 is not in the tree. The production signer is still a `DevSigner` argument on `Gateway::control_plane`.
 
 ## 10. Related documents
 

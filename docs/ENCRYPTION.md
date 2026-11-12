@@ -77,7 +77,7 @@ It schedules destruction of that key in the KMS. After the KMS destroys it, data
 - A share of unwrapped KEKs through Redis or any store other than the process that called the KMS.
 - Multi-region active-active KMS. v1 is one region. The KMS is a hard availability dependency for `wrap_mode=gateway`.
 - Human identity, SSO, and the dashboard as part of this crypto spec. The workspace credential below is only the bootstrap admin credential. `credentials-edge` has OIDC PKCE helpers and a WebAuthn software authenticator. SAML is not implemented. The dashboard HTML does not decrypt a secret.
-- A live call to Infisical, 1Password, Doppler, or Vault at injection time. A team imports a secret one time. Credentials stores that secret under the native envelope. HTTP readers for those products exist in `credentials-edge`. Default CI does not call those live APIs. Zero-knowledge against the operator is required for production. The dev gateway decrypts `wrap_mode=gateway`. The production control plane must not decrypt an e2e secret.
+- A live call to Infisical, 1Password, Doppler, or Vault at injection time. A team imports a secret one time. Credentials stores that secret under the native envelope. HTTP readers for those products exist in `credentials-edge`. The integration job calls Vault KV. Infisical, Doppler, and 1Password stay on local fixtures. Zero-knowledge against the operator is required for production. The dev gateway decrypts `wrap_mode=gateway`. The production control plane must not decrypt an e2e secret.
 
 ## 3. Threat model
 
@@ -1155,9 +1155,9 @@ Write the same bytes to the anchor.
 The hosted anchor is an object store with a retention lock (S3 Object Lock or the equivalent), keyed by `{workspace_id}/{seq}`.
 The publisher IAM role can put objects and cannot delete them.
 The database role has no permission on the bucket.
-Default CI does not use S3 Object Lock.
+The integration job puts one compliance-mode object in MinIO. It does not call AWS S3.
 `credentials-edge` can send an object with compliance-mode headers.
-Default CI does not start that store.
+The integration job starts MinIO for that check. It does not call AWS S3.
 A self-hosted deployment supplies an `AuditAnchor` implementation.
 The dev implementation appends to a local file and is rejected when `CREDENTIALS_ENV=production`, the same rule as the dev KMS.
 
@@ -1363,7 +1363,7 @@ Release ciphertext after the allow event, or release nothing if the append fails
 Credentials stores the secret.
 A team moves a secret in one time, from Infisical, 1Password Connect, Doppler, Vault KV, or a `.env` file.
 HTTP readers for Infisical, Doppler, 1Password Connect, and Vault KV exist in `credentials-edge`.
-Default CI does not call those live APIs.
+The integration job calls Vault KV. Infisical, Doppler, and 1Password stay on local fixtures.
 The injector seals a native secret version under the envelope and discards the source bytes.
 Injection then uses only that ciphertext.
 The control plane does not call those products at inject time.
@@ -1521,7 +1521,7 @@ Do not add them again as unused code.
 7. Build delivery policies and proxy inject. Build local `env` and `header` behind the peer-credential channel.
 8. Build the audit hash chain, checkpoints, the anchor interface, and tests 9, 10, and 14.
 9. Build the TLS configuration and test 16.
-10. Build one real KMS adapter, an integration test that needs credentials, and the IAM roles in section 6. Default CI does not call a live KMS.
+10. Build one real KMS adapter, an integration test that needs credentials, and the IAM roles in section 6. The integration job calls LocalStack KMS. It does not call AWS KMS.
 
 Each step can be tested on its own.
 Do not start at the HTTP layer and add encryption afterwards.
@@ -1535,7 +1535,7 @@ None of them blocks the envelope, the token check, or the audit chain.
 
 | Topic | What to build now | What might change |
 | --- | --- | --- |
-| Audit retention after shred | 90 days, as a per-workspace setting. | A contract that requires immediate deletion of audit metadata. A retention-locked anchor may be impossible to delete. Put that constraint in the contract. Default CI does not use S3 Object Lock. |
+| Audit retention after shred | 90 days, as a per-workspace setting. | A contract that requires immediate deletion of audit metadata. A retention-locked anchor may be impossible to delete. Put that constraint in the contract. The integration job puts one compliance-mode object in MinIO. It does not call AWS S3. |
 | Second person to approve shred | One confirmation field equal to the workspace id, plus the KMS waiting period. | A two-person rule. The waiting period already covers an accidental shred. |
 | Hybrid signatures on tokens | Ed25519 or ES256 through KMS Sign. `DevSigner` is the current signer. | Ed25519 plus ML-DSA-65 after a reviewed library and a signing-key story exist. `alg` and `kid` are already on the token, so a verifier can add a second algorithm. |
 | Multi-region | One region. A KMS outage fails the `wrap_mode=gateway` request. | A replica key, and a rule for which region may decrypt. Do not copy tenant root key material into the database to get there. |

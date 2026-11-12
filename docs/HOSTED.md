@@ -6,7 +6,7 @@ The hosted process is the production control plane in [SELF_HOST.md](SELF_HOST.m
 
 The customer injector performs hosted injection. This build does not run an attested enclave. If the injector is down, injection stops. The control plane does not decrypt to replace it.
 
-The audit anchor in this build is an append-only file. It has no delete operation. It is not S3 Object Lock. `credentials-edge` can send an object with compliance-mode headers. Default CI does not start MinIO.
+The audit anchor in this build is an append-only file. It has no delete operation. It is not S3 Object Lock. `credentials-edge` can send an object with compliance-mode headers. The integration job starts MinIO for that check. It does not call AWS S3.
 
 Two workspaces do not share secret rows, sessions, or audit chains. The store keys those rows by workspace id.
 
