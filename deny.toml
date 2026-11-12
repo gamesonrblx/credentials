@@ -6,7 +6,12 @@ unmaintained = "workspace"
 # that pin cannot take. The bundled copy is what Windows and macOS CI link.
 # The gateway creates its own database and does not open WAL mode, which is
 # the condition in RUSTSEC-2026-0459. Drop this ignore when sqlx moves up.
-ignore = ["RUSTSEC-2026-0459"]
+# webauthn-rs 0.6.2 pins rsa 0.10.0-rc.19 through crypto-glue. The advisory
+# marks only rsa >=0.10.0 as patched, and a pre-release sorts below that.
+# The rc is the constant-time 0.10 series. This tree signs and verifies
+# with P-256. It does not perform an RSA private-key operation. Drop this
+# ignore when crypto-glue depends on rsa >=0.10.0.
+ignore = ["RUSTSEC-2026-0459", "RUSTSEC-2023-0071"]
 
 [licenses]
 version = 2
