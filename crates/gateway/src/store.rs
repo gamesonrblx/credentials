@@ -173,6 +173,13 @@ pub trait Store: Send + Sync {
         &self,
         workspace_id: Uuid,
     ) -> Result<Option<CheckpointRow>, ApiError>;
+    async fn set_secret_status(
+        &self,
+        workspace_id: Uuid,
+        name: &str,
+        status: &str,
+    ) -> Result<(), ApiError>;
+    async fn list_sessions(&self, workspace_id: Uuid) -> Result<Vec<SessionRow>, ApiError>;
 }
 
 #[derive(Clone, Debug)]
@@ -566,6 +573,31 @@ impl Store for MemoryStore {
             .rev()
             .find(|row| row.workspace_id == workspace_id)
             .cloned())
+    }
+
+    async fn set_secret_status(
+        &self,
+        workspace_id: Uuid,
+        name: &str,
+        status: &str,
+    ) -> Result<(), ApiError> {
+        let mut state = lock(&self.inner);
+        let secret = state
+            .secrets
+            .values_mut()
+            .find(|secret| secret.workspace_id == workspace_id && secret.name == name)
+            .ok_or(ApiError::NotFound)?;
+        secret.status = status.to_owned();
+        Ok(())
+    }
+
+    async fn list_sessions(&self, workspace_id: Uuid) -> Result<Vec<SessionRow>, ApiError> {
+        Ok(lock(&self.inner)
+            .sessions
+            .values()
+            .filter(|session| session.workspace_id == workspace_id)
+            .cloned()
+            .collect())
     }
 }
 

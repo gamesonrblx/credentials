@@ -203,6 +203,59 @@ async fn a_new_version_does_not_replace_the_previous_ciphertext() {
 }
 
 #[tokio::test]
+async fn a_disabled_secret_does_not_unwrap() {
+    let env = setup().await;
+    env.gateway
+        .create_secret(
+            &env.credential,
+            "prod/openai/api_key",
+            b"sk-test-value",
+            policy(),
+        )
+        .await
+        .unwrap();
+    env.gateway
+        .disable_secret(&env.credential, "prod/openai/api_key")
+        .await
+        .unwrap();
+    let decrypts = env.kms.decrypts();
+    let dpop = generate_dpop().unwrap();
+    let agent = env
+        .gateway
+        .create_agent(&env.credential, "runner")
+        .await
+        .unwrap();
+    let session = env
+        .gateway
+        .create_session(
+            &env.credential,
+            agent,
+            vec!["secret:inject:prod/openai/api_key".into()],
+            Some(60),
+            dpop.public_b64(),
+        )
+        .await
+        .unwrap();
+    let listed = env.gateway.list_sessions(&env.credential).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    let htu = "https://credentials.local/v1/inject";
+    let proof = dpop.proof(
+        "POST",
+        htu,
+        &session.token,
+        env.clock.unix_secs(),
+        "proof-off",
+    );
+    let err = env
+        .gateway
+        .inject(request(&session.token, &proof, htu))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "forbidden");
+    assert_eq!(env.kms.decrypts(), decrypts);
+}
+
+#[tokio::test]
 async fn revoked_and_expired_tokens_do_not_unwrap() {
     let env = setup().await;
     env.gateway

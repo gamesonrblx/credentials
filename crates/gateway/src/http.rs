@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::b64::{b64std_decode, b64std_encode};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -26,9 +27,12 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route("/healthz", get(health))
         .route("/v1/workspaces", post(create_workspace))
         .route("/v1/secrets", post(create_secret))
-        .route("/v1/secrets/{*tail}", post(create_version))
+        .route("/v1/secrets/{*tail}", post(secret_action))
         .route("/v1/agents", post(create_agent))
-        .route("/v1/agent-sessions", post(create_session))
+        .route(
+            "/v1/agent-sessions",
+            post(create_session).get(list_sessions),
+        )
         .route("/v1/agent-sessions/{id}/revoke", post(revoke_session))
         .route("/v1/inject", post(inject))
         .route("/v1/audit", get(audit))
@@ -122,22 +126,31 @@ async fn create_secret(
     }))
 }
 
-#[derive(Deserialize)]
-struct VersionBody {
-    value: String,
-}
-
-async fn create_version(
+async fn secret_action(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::extract::Path(tail): axum::extract::Path<String>,
-    Json(body): Json<VersionBody>,
-) -> Result<Json<VersionResponse>, ApiError> {
+    Json(body): Json<serde_json::Value>,
+) -> Result<axum::response::Response, ApiError> {
+    if let Some(name) = tail
+        .strip_suffix("/disable")
+        .filter(|name| !name.is_empty() && !name.ends_with('/'))
+    {
+        state
+            .gateway
+            .disable_secret(bearer(&headers)?, name)
+            .await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
     let name = tail
         .strip_suffix("/versions")
         .filter(|name| !name.is_empty() && !name.ends_with('/'))
         .ok_or(ApiError::NotFound)?;
-    let value = b64std_decode(&body.value)?;
+    let encoded = body
+        .get("value")
+        .and_then(|value| value.as_str())
+        .ok_or(ApiError::BadRequest)?;
+    let value = b64std_decode(encoded)?;
     let created = state
         .gateway
         .create_version(bearer(&headers)?, name, &value)
@@ -146,7 +159,8 @@ async fn create_version(
         secret_id: created.secret_id,
         version_id: created.version_id,
         version: created.version,
-    }))
+    })
+    .into_response())
 }
 
 #[derive(Deserialize)]
@@ -205,6 +219,39 @@ async fn create_session(
         session_id: created.session_id,
         token: created.token,
         expires_at: created.expires_at,
+    }))
+}
+
+#[derive(Serialize)]
+struct SessionListResponse {
+    sessions: Vec<SessionListItem>,
+}
+
+#[derive(Serialize)]
+struct SessionListItem {
+    session_id: Uuid,
+    agent_id: Uuid,
+    expires_at: u64,
+    revoked_at: Option<u64>,
+    scopes: Vec<String>,
+}
+
+async fn list_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SessionListResponse>, ApiError> {
+    let sessions = state.gateway.list_sessions(bearer(&headers)?).await?;
+    Ok(Json(SessionListResponse {
+        sessions: sessions
+            .into_iter()
+            .map(|session| SessionListItem {
+                session_id: session.id,
+                agent_id: session.agent_id,
+                expires_at: session.expires_at,
+                revoked_at: session.revoked_at,
+                scopes: session.scopes,
+            })
+            .collect(),
     }))
 }
 
@@ -293,6 +340,7 @@ struct AuditQuery {
 #[derive(Serialize)]
 struct AuditResponse {
     events: Vec<AuditEventResponse>,
+    checkpoint: Option<AuditCheckpointResponse>,
 }
 
 #[derive(Serialize)]
@@ -301,6 +349,14 @@ struct AuditEventResponse {
     agent_id: Option<Uuid>,
     event_type: String,
     hash_hex: String,
+    prev_hash_hex: String,
+}
+
+#[derive(Serialize)]
+struct AuditCheckpointResponse {
+    seq: u64,
+    kid: String,
+    signature_hex: String,
 }
 
 async fn audit(
@@ -308,10 +364,9 @@ async fn audit(
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> Result<Json<AuditResponse>, ApiError> {
-    let events = state
-        .gateway
-        .audit_log(bearer(&headers)?, query.agent_id)
-        .await?;
+    let credential = bearer(&headers)?;
+    let checkpoint = state.gateway.latest_checkpoint(credential).await?;
+    let events = state.gateway.audit_log(credential, query.agent_id).await?;
     Ok(Json(AuditResponse {
         events: events
             .into_iter()
@@ -320,8 +375,14 @@ async fn audit(
                 agent_id: event.agent_id,
                 event_type: event.event_type,
                 hash_hex: hex_encode(&event.hash),
+                prev_hash_hex: hex_encode(&event.prev_hash),
             })
             .collect(),
+        checkpoint: checkpoint.map(|row| AuditCheckpointResponse {
+            seq: row.seq,
+            kid: row.kid,
+            signature_hex: hex_encode(&row.signature),
+        }),
     }))
 }
 

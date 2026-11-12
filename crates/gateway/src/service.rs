@@ -400,6 +400,27 @@ impl Gateway {
         })
     }
 
+    pub async fn disable_secret(&self, credential: &str, name: &str) -> Result<(), ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        self.ensure_active(&workspace)?;
+        self.store
+            .set_secret_status(workspace.id, name, "disabled")
+            .await
+    }
+
+    pub async fn list_sessions(&self, credential: &str) -> Result<Vec<SessionRow>, ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        self.store.list_sessions(workspace.id).await
+    }
+
+    pub async fn latest_checkpoint(
+        &self,
+        credential: &str,
+    ) -> Result<Option<crate::store::CheckpointRow>, ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        self.store.latest_checkpoint(workspace.id).await
+    }
+
     pub async fn create_agent(
         &self,
         credential: &str,

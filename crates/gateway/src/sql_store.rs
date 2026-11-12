@@ -955,6 +955,48 @@ impl Store for SqlStore {
             }
         )
     }
+
+    async fn set_secret_status(
+        &self,
+        workspace_id: Uuid,
+        name: &str,
+        status: &str,
+    ) -> Result<(), ApiError> {
+        let changed = on_pool!(
+            self,
+            "UPDATE secrets SET status = ? WHERE workspace_id = ? AND name = ?",
+            |db, q| {
+                sqlx::query(q)
+                    .bind(status)
+                    .bind(workspace_id)
+                    .bind(name)
+                    .execute(db)
+                    .await
+                    .map_err(map_db)?
+                    .rows_affected()
+            }
+        );
+        if changed == 0 {
+            Err(ApiError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn list_sessions(&self, workspace_id: Uuid) -> Result<Vec<SessionRow>, ApiError> {
+        on_pool!(
+            self,
+            "SELECT id, workspace_id, agent_id, dpop_jkt, scopes, expires_at, revoked_at FROM agent_sessions WHERE workspace_id = ?",
+            |db, q| {
+                let rows = sqlx::query(q)
+                    .bind(workspace_id)
+                    .fetch_all(db)
+                    .await
+                    .map_err(map_db)?;
+                rows.iter().map(|row| session_from!(row)).collect()
+            }
+        )
+    }
 }
 
 const VERSION_COLS: &str = "SELECT id, secret_id, workspace_id, version, payload_alg, payload_nonce, payload_ciphertext, dek_wrap_alg, dek_wrap_nonce, dek_wrapped, kek_id, wrap_mode, e2e_encapsulation, plaintext_len FROM secret_versions";
