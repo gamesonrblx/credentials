@@ -12,7 +12,7 @@ description = "Customer-side and operator adapters that do not let the hosted co
 base64 = "0.23.1"
 getrandom = "0.4.3"
 credentials-crypto = { path = "../crypto" }
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
