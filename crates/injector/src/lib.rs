@@ -14,6 +14,70 @@ pub enum InjectorError {
     Open,
 }
 
+/// One sealed import. The source plaintext is not a field.
+pub struct Imported {
+    pub name: String,
+    pub sealed: credentials_crypto::E2eSealed,
+    pub ids: credentials_crypto::VersionIds,
+}
+
+/// Seal each pair and return only ciphertext. The caller drops `pairs`.
+/// This does not call Infisical, Doppler, 1Password, Vault, or a `.env` file
+/// at inject time.
+pub fn import_pairs(
+    pairs: &[(String, String)],
+    encapsulation_key: &[u8],
+    workspace_id: Uuid,
+    workspace_key_id: Uuid,
+) -> Result<Vec<Imported>, InjectorError> {
+    let mut out = Vec::with_capacity(pairs.len());
+    for (name, value) in pairs {
+        if name.is_empty() || value.is_empty() {
+            return Err(InjectorError::Grant);
+        }
+        let ids = credentials_crypto::VersionIds {
+            workspace_id,
+            secret_id: Uuid::now_v7(),
+            version_id: Uuid::now_v7(),
+        };
+        let sealed = credentials_crypto::seal_e2e(
+            encapsulation_key,
+            workspace_key_id,
+            ids,
+            value.as_bytes(),
+            65_536,
+        )
+        .map_err(|_| InjectorError::Open)?;
+        out.push(Imported {
+            name: name.clone(),
+            sealed,
+            ids,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse `KEY=VALUE` lines. Blank lines and `#` comments are skipped.
+pub fn import_dotenv(
+    source: &str,
+    encapsulation_key: &[u8],
+    workspace_id: Uuid,
+    workspace_key_id: Uuid,
+) -> Result<Vec<Imported>, InjectorError> {
+    let mut pairs = Vec::new();
+    for line in source.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            return Err(InjectorError::Grant);
+        };
+        pairs.push((name.trim().to_owned(), value.trim().to_owned()));
+    }
+    import_pairs(&pairs, encapsulation_key, workspace_id, workspace_key_id)
+}
+
 pub fn open_grant(decapsulation_key: &[u8; 32], grant: &[u8]) -> Result<Vec<u8>, InjectorError> {
     let value: serde_json::Value =
         serde_json::from_slice(grant).map_err(|_| InjectorError::Grant)?;
@@ -66,7 +130,7 @@ fn nonce(value: &serde_json::Value, name: &str) -> Result<[u8; 12], InjectorErro
 
 #[cfg(test)]
 mod tests {
-    use super::open_grant;
+    use super::{import_dotenv, open_grant};
     use credentials_crypto::{generate_hybrid_keypair, seal_e2e, VersionIds};
     use uuid::Uuid;
 
@@ -97,6 +161,29 @@ mod tests {
         let opened = open_grant(pair.decapsulation_key(), &bytes).unwrap();
         assert_eq!(opened, b"sk-injector");
         assert!(open_grant(&[9u8; 32], &bytes).is_err());
+    }
+
+    #[test]
+    fn dotenv_import_seals_and_drops_the_source_value() {
+        let pair = generate_hybrid_keypair().unwrap();
+        let workspace_id = Uuid::now_v7();
+        let key_id = Uuid::now_v7();
+        let source = "# comment\nOPENAI_API_KEY=sk-import-canary\n\n";
+        let imported =
+            import_dotenv(source, &pair.encapsulation_key, workspace_id, key_id).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].name, "OPENAI_API_KEY");
+        let blob = &imported[0].sealed.payload_ciphertext;
+        assert!(!blob
+            .windows(b"sk-import-canary".len())
+            .any(|w| w == b"sk-import-canary"));
+        let opened = credentials_crypto::open_e2e(
+            pair.decapsulation_key(),
+            &imported[0].sealed,
+            imported[0].ids,
+        )
+        .unwrap();
+        assert_eq!(opened.as_slice(), b"sk-import-canary");
     }
 
     fn b64(bytes: &[u8]) -> String {
