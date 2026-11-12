@@ -27,6 +27,8 @@ pub struct AppState {
     pub operator_token: Option<String>,
     /// True only on the local Unix socket. The public listener leaves this false.
     pub local_channel: bool,
+    /// True when this router is behind the TLS listener. DPoP `htu` uses it.
+    pub tls: bool,
 }
 
 pub fn router(gateway: Arc<Gateway>) -> Router {
@@ -38,6 +40,17 @@ pub fn router_with_bootstrap(gateway: Arc<Gateway>, operator_token: Option<Strin
         gateway,
         operator_token,
         local_channel: false,
+        tls: false,
+    })
+}
+
+/// Public routes behind the TLS listener. DPoP `htu` uses `https`.
+pub fn router_tls(gateway: Arc<Gateway>, operator_token: Option<String>) -> Router {
+    routes().with_state(AppState {
+        gateway,
+        operator_token,
+        local_channel: false,
+        tls: true,
     })
 }
 
@@ -47,6 +60,7 @@ pub fn router_local(gateway: Arc<Gateway>) -> Router {
         gateway,
         operator_token: None,
         local_channel: true,
+        tls: false,
     })
 }
 
@@ -98,12 +112,12 @@ async fn create_workspace(
 ) -> Result<Json<WorkspaceResponse>, ApiError> {
     if let Some(expected) = &state.operator_token {
         let presented = bearer(&headers).unwrap_or("");
-        if presented.len() != expected.len()
-            || !bool::from(subtle::ConstantTimeEq::ct_eq(
-                presented.as_bytes(),
-                expected.as_bytes(),
-            ))
-        {
+        let presented_hash = sha256(presented.as_bytes());
+        let expected_hash = sha256(expected.as_bytes());
+        if !bool::from(subtle::ConstantTimeEq::ct_eq(
+            presented_hash.as_slice(),
+            expected_hash.as_slice(),
+        )) {
             return Err(ApiError::Unauthenticated);
         }
     }
@@ -354,11 +368,7 @@ async fn inject(
         url: String::new(),
         body: String::new(),
     });
-    let htu = headers
-        .get("x-dpop-htu")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("https://credentials.local/v1/inject")
-        .to_owned();
+    let htu = request_htu(&headers, state.tls)?;
     let response = state
         .gateway
         .inject(InjectRequest {
@@ -647,6 +657,33 @@ async fn store_e2e_secret(
 
 fn arr12(bytes: Vec<u8>) -> Result<[u8; 12], ApiError> {
     bytes.try_into().map_err(|_| ApiError::BadRequest)
+}
+
+/// DPoP `htu` is the request the server actually received. A client-supplied
+/// `x-dpop-htu` header is not consulted.
+fn request_htu(headers: &HeaderMap, tls: bool) -> Result<String, ApiError> {
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(ApiError::BadRequest)?;
+    if host.is_empty()
+        || host.len() > 253
+        || host
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch == '/' || ch == '\\' || ch == '@' || ch == '?')
+    {
+        return Err(ApiError::BadRequest);
+    }
+    let scheme = if tls { "https" } else { "http" };
+    Ok(format!("{scheme}://{host}/v1/inject"))
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 fn bearer(headers: &HeaderMap) -> Result<&str, ApiError> {

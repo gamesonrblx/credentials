@@ -88,10 +88,103 @@ async fn main() {
         }
     }
 
+    let require_hybrid = match std::env::var("TLS_REQUIRE_HYBRID") {
+        Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE"),
+        Err(_) => !policy.allow_dev,
+    };
+    let cert_path = std::env::var("CREDENTIALS_TLS_CERT").ok();
+    let key_path = std::env::var("CREDENTIALS_TLS_KEY").ok();
+    if require_hybrid && (cert_path.is_none() || key_path.is_none()) {
+        eprintln!("TLS_REQUIRE_HYBRID is on. Set CREDENTIALS_TLS_CERT and CREDENTIALS_TLS_KEY");
+        std::process::exit(1);
+    }
+    if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
+        let certs = match load_certs(&cert_path) {
+            Ok(certs) => certs,
+            Err(err) => {
+                eprintln!("tls cert: {err}");
+                std::process::exit(1);
+            }
+        };
+        let key = match load_key(&key_path) {
+            Ok(key) => key,
+            Err(err) => {
+                eprintln!("tls key: {err}");
+                std::process::exit(1);
+            }
+        };
+        let Some(cert) = certs.into_iter().next() else {
+            eprintln!("tls cert file is empty");
+            std::process::exit(1);
+        };
+        if let Err(err) =
+            credentials_gateway::serve_tls(gateway, addr, operator_token, cert, key, require_hybrid)
+                .await
+        {
+            eprintln!("tls server: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if let Err(err) = serve_with(gateway, addr, operator_token).await {
         eprintln!("server: {err}");
         std::process::exit(1);
     }
+}
+
+fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+    let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+    let ders = pem_ders(&bytes, "CERTIFICATE")?;
+    if ders.is_empty() {
+        return Err("no certificate".into());
+    }
+    Ok(ders
+        .into_iter()
+        .map(rustls::pki_types::CertificateDer::from)
+        .collect())
+}
+
+fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
+    let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+    if let Ok(der) = pem_ders(&bytes, "PRIVATE KEY") {
+        if let Some(der) = der.into_iter().next() {
+            return Ok(rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(der),
+            ));
+        }
+    }
+    let der = pem_ders(&bytes, "EC PRIVATE KEY")?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no private key".to_string())?;
+    Ok(rustls::pki_types::PrivateKeyDer::Sec1(
+        rustls::pki_types::PrivateSec1KeyDer::from(der),
+    ))
+}
+
+fn pem_ders(bytes: &[u8], label: &str) -> Result<Vec<Vec<u8>>, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "pem is not utf-8".to_string())?;
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(&begin) {
+        rest = &rest[start + begin.len()..];
+        let Some(stop) = rest.find(&end) else {
+            return Err("pem block is not closed".into());
+        };
+        let body: String = rest[..stop]
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        out.push(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body)
+                .map_err(|_| "pem is not base64".to_string())?,
+        );
+        rest = &rest[stop + end.len()..];
+    }
+    Ok(out)
 }
 
 async fn build_dev(policy: DevPolicy) -> Gateway {

@@ -10,6 +10,6 @@ The audit anchor in this build is an append-only file. It has no delete operatio
 
 Two workspaces do not share secret rows, sessions, or audit chains. The store keys those rows by workspace id.
 
-`TLS_REQUIRE_HYBRID` is not offered. This build does not negotiate TLS group 4588, and it does not pretend a handshake test passed. The public listener is plain HTTP until that group can be tested.
+Hosted mode sets `TLS_REQUIRE_HYBRID` on. The listener offers only `X25519MLKEM768` (group 4588). A client that does not offer that group cannot connect. The certificate and key come from `CREDENTIALS_TLS_CERT` and `CREDENTIALS_TLS_KEY`.
 
 A signing-key outage stops token issue and audit signatures. It is not worked around by unwrapping secrets.

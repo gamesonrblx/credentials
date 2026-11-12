@@ -400,7 +400,7 @@ Symmetric encryption of secret payloads is AES-256-GCM. **Implemented.** AES-256
 | Hop | Construction | Status |
 | --- | --- | --- |
 | Secret payload at rest | AES-256-GCM, 32-byte data key, 12-byte nonce, 16-byte tag | **Implemented.** |
-| TLS | TLS 1.3 group `X25519MLKEM768`, RFC 10024, code point 4588 | **Planned (M4).** This build has no TLS stack. `credentials-client` is built without a TLS backend. Hosted production sets `TLS_REQUIRE_HYBRID=true`. |
+| TLS | TLS 1.3 group `X25519MLKEM768`, RFC 10024, code point 4588 | **Implemented.** rustls with aws-lc-rs negotiates group 4588. `TLS_REQUIRE_HYBRID` defaults to on in production and offers only that group. |
 | Application key wrapping | X-Wing, X25519 + ML-KEM-768, `draft-connolly-cfrg-xwing-kem` | The library path is **implemented** in `crates/crypto/src/hybrid.rs`: generate a keypair, wrap a 32-byte key, unwrap it. Encapsulation keys are 1216 bytes and encapsulations are 1120 bytes, and tests check those lengths. The gateway-decrypts path does not call it. Using it for the workspace key, device wraps, and data-key wraps is **planned (M3)**. |
 | JWT and DPoP signatures | Ed25519 | **Implemented.** Hybrid signatures, Ed25519 plus ML-DSA-65, are an open question tracked toward **planned (M7)**. Forging those signatures would mint or replay tokens. It would not open stored ciphertext. |
 

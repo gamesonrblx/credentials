@@ -18,6 +18,6 @@ Status: public pre-alpha. No SOC 2, customer, or certification claim. No product
 
 `compose.yaml` is an example with Postgres 16. The database password in that file is for the example. The injector service is behind the `injector` profile so the control-plane container does not receive a decapsulation key.
 
-Hybrid TLS group 4588 (`X25519MLKEM768`) is not negotiated by this build. Spec test 16 is not claimed. The listener is plain HTTP until a stack that can actually negotiate that group is wired.
+Set `CREDENTIALS_TLS_CERT` and `CREDENTIALS_TLS_KEY` to PEM files. The listener then uses TLS 1.3. The first key-exchange group is `X25519MLKEM768` (group 4588). `TLS_REQUIRE_HYBRID=true` offers only that group. In production, that flag defaults to on, and the process exits when the certificate files are absent. A dev process leaves the flag off and can listen without TLS.
 
 There is no cloud KMS in this build. The production signing key is a local file. It signs tokens and audit tips. It does not unwrap secret data keys.

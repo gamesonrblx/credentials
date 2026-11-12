@@ -28,13 +28,14 @@ mod redact;
 mod service;
 mod sql_store;
 mod store;
+mod tls;
 mod token;
 mod upstream;
 
 pub use anchor::{checkpoint_message, AuditAnchor, DevFileAnchor, FileAnchor, MemoryAnchor};
 pub use audit::{verify_chain, AuditRecord};
 pub use error::ApiError;
-pub use http::{router, router_local, router_with_bootstrap};
+pub use http::{router, router_local, router_tls, router_with_bootstrap};
 #[cfg(unix)]
 pub use local::{peer_uid_allowed, serve_local};
 pub use policy::{Delivery, DeliveryPolicy};
@@ -45,6 +46,10 @@ pub use service::{
 };
 pub use sql_store::SqlStore;
 pub use store::{MemoryStore, RecipientRow, Store, WrapMode};
+pub use tls::{
+    group_code, hybrid_provider, is_hybrid, serve_tls, server_config, tls_classical_kex_total,
+    HYBRID_GROUP,
+};
 pub use token::DevSigner;
 pub use upstream::{HttpUpstream, Outbound, RecordingUpstream, UnconfiguredUpstream, Upstream};
 

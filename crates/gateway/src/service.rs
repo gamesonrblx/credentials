@@ -801,7 +801,7 @@ impl Gateway {
         if proof.jkt != claims.jkt {
             return Err(ApiError::Unauthenticated);
         }
-        self.remember_dpop(&proof_jti(&request.dpop)?, self.clock.unix_secs())?;
+        self.remember_dpop(&proof.jti, self.clock.unix_secs())?;
 
         let secret = match self
             .store
@@ -1568,18 +1568,6 @@ fn access_fields(
         fields.push(("upstream_host".into(), AuditValue::String(host.to_owned())));
     }
     fields
-}
-
-fn proof_jti(proof: &str) -> Result<String, ApiError> {
-    let payload_b64 = proof.split('.').nth(1).ok_or(ApiError::Unauthenticated)?;
-    let bytes = crate::b64::b64url_decode(payload_b64)?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| ApiError::Unauthenticated)?;
-    value
-        .get("jti")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned)
-        .ok_or(ApiError::Unauthenticated)
 }
 
 fn random_32() -> Result<[u8; 32], ApiError> {

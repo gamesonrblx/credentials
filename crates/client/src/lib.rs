@@ -4,6 +4,10 @@
 //! attach a DPoP proof signed with `ed25519-dalek`. Secret values are base64
 //! on the wire and are not written to logs by this crate.
 
+mod tls;
+
+pub use tls::{hybrid_config, hybrid_http, HYBRID_GROUP};
+
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
@@ -73,7 +77,7 @@ impl DpopKey {
 impl CredentialsClient {
     pub fn new(base: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: tls::hybrid_http(false),
             base: base.into().trim_end_matches('/').to_owned(),
             credential: None,
         }
