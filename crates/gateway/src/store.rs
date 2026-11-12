@@ -43,12 +43,62 @@ impl WrapMode {
     }
 }
 
-/// Gateway-wrapped rows are the only ones this build can open.
+/// Gateway-wrapped rows carry no X-Wing encapsulation.
 pub fn ensure_gateway(mode: WrapMode, encapsulation: Option<&[u8]>) -> Result<(), ApiError> {
     if mode == WrapMode::Gateway && encapsulation.is_none() {
         Ok(())
     } else {
         Err(ApiError::BadRequest)
+    }
+}
+
+/// Accept a gateway row, or an end-to-end row whose encapsulation is 1120 bytes
+/// and whose data-key wrap label is CRD2. Anything else is rejected.
+pub fn ensure_stored(version: &VersionRow) -> Result<(), ApiError> {
+    match version.wrap_mode {
+        WrapMode::Gateway => {
+            ensure_gateway(version.wrap_mode, version.e2e_encapsulation.as_deref())
+        }
+        WrapMode::E2e => {
+            if version.sealed.dek_wrap_alg != credentials_crypto::E2E_DEK_WRAP_ALG {
+                return Err(ApiError::BadRequest);
+            }
+            match version.e2e_encapsulation.as_deref() {
+                Some(bytes) if bytes.len() == credentials_crypto::E2E_ENCAPSULATION_LEN => Ok(()),
+                _ => Err(ApiError::BadRequest),
+            }
+        }
+    }
+}
+
+const RECIPIENT_KINDS: &[&str] = &["device", "passkey", "recovery_kit", "teammate"];
+
+pub fn ensure_recipient(row: &RecipientRow) -> Result<(), ApiError> {
+    if !RECIPIENT_KINDS.contains(&row.kind.as_str())
+        || row.wrap_nonce.len() != 12
+        || row.wrapped_key.is_empty()
+    {
+        return Err(ApiError::BadRequest);
+    }
+    match row.kind.as_str() {
+        "device" | "teammate" => match (&row.encapsulation_key, &row.encapsulation) {
+            (Some(key), Some(enc))
+                if key.len() == credentials_crypto::E2E_ENCAPSULATION_KEY_LEN
+                    && enc.len() == credentials_crypto::E2E_ENCAPSULATION_LEN =>
+            {
+                Ok(())
+            }
+            _ => Err(ApiError::BadRequest),
+        },
+        "passkey" => match &row.prf_salt {
+            Some(salt) if !salt.is_empty() && salt.len() <= 64 => Ok(()),
+            _ => Err(ApiError::BadRequest),
+        },
+        "recovery_kit" => match &row.kdf_params {
+            Some(params) if params.contains("memory_kib") => Ok(()),
+            _ => Err(ApiError::BadRequest),
+        },
+        _ => Err(ApiError::BadRequest),
     }
 }
 
@@ -180,6 +230,33 @@ pub trait Store: Send + Sync {
         status: &str,
     ) -> Result<(), ApiError>;
     async fn list_sessions(&self, workspace_id: Uuid) -> Result<Vec<SessionRow>, ApiError>;
+    async fn insert_workspace_key(&self, row: WorkspaceKeyRow) -> Result<(), ApiError>;
+    async fn workspace_key(&self, workspace_id: Uuid) -> Result<WorkspaceKeyRow, ApiError>;
+    async fn insert_recipient(&self, row: RecipientRow) -> Result<(), ApiError>;
+    async fn list_recipients(&self, workspace_id: Uuid) -> Result<Vec<RecipientRow>, ApiError>;
+    async fn revoke_recipient(&self, workspace_id: Uuid, id: Uuid, at: u64)
+        -> Result<(), ApiError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceKeyRow {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub encapsulation_key: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecipientRow {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub kind: String,
+    pub encapsulation_key: Option<Vec<u8>>,
+    pub encapsulation: Option<Vec<u8>>,
+    pub prf_salt: Option<Vec<u8>>,
+    pub kdf_params: Option<String>,
+    pub wrap_nonce: Vec<u8>,
+    pub wrapped_key: Vec<u8>,
+    pub revoked_at: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -205,6 +282,8 @@ struct State {
     checkpoints: Vec<CheckpointRow>,
     tips: HashMap<Uuid, [u8; 32]>,
     agent_tips: HashMap<(Uuid, Uuid), ([u8; 32], u64)>,
+    workspace_keys: HashMap<Uuid, WorkspaceKeyRow>,
+    recipients: HashMap<Uuid, RecipientRow>,
 }
 
 pub struct MemoryStore {
@@ -390,7 +469,7 @@ impl Store for MemoryStore {
         version: VersionRow,
         audit: AuditDraft,
     ) -> Result<(), ApiError> {
-        ensure_gateway(version.wrap_mode, version.e2e_encapsulation.as_deref())?;
+        ensure_stored(&version)?;
         self.write_checked(|state| {
             append_locked(state, audit, self.fail_appends.load(Ordering::Relaxed))?;
             state.secrets.insert(secret.id, secret);
@@ -400,7 +479,7 @@ impl Store for MemoryStore {
     }
 
     async fn insert_version(&self, version: VersionRow, audit: AuditDraft) -> Result<(), ApiError> {
-        ensure_gateway(version.wrap_mode, version.e2e_encapsulation.as_deref())?;
+        ensure_stored(&version)?;
         self.write_checked(|state| {
             if !state.secrets.contains_key(&version.secret_id) {
                 return Err(ApiError::NotFound);
@@ -599,6 +678,64 @@ impl Store for MemoryStore {
             .cloned()
             .collect())
     }
+
+    async fn insert_workspace_key(&self, row: WorkspaceKeyRow) -> Result<(), ApiError> {
+        if row.encapsulation_key.len() != credentials_crypto::E2E_ENCAPSULATION_KEY_LEN {
+            return Err(ApiError::BadRequest);
+        }
+        self.write_checked(|state| {
+            if state
+                .workspace_keys
+                .values()
+                .any(|key| key.workspace_id == row.workspace_id)
+            {
+                return Err(ApiError::BadRequest);
+            }
+            state.workspace_keys.insert(row.id, row);
+            Ok(())
+        })
+    }
+
+    async fn workspace_key(&self, workspace_id: Uuid) -> Result<WorkspaceKeyRow, ApiError> {
+        lock(&self.inner)
+            .workspace_keys
+            .values()
+            .find(|key| key.workspace_id == workspace_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+
+    async fn insert_recipient(&self, row: RecipientRow) -> Result<(), ApiError> {
+        ensure_recipient(&row)?;
+        self.write_checked(|state| {
+            state.recipients.insert(row.id, row);
+            Ok(())
+        })
+    }
+
+    async fn list_recipients(&self, workspace_id: Uuid) -> Result<Vec<RecipientRow>, ApiError> {
+        Ok(lock(&self.inner)
+            .recipients
+            .values()
+            .filter(|row| row.workspace_id == workspace_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn revoke_recipient(
+        &self,
+        workspace_id: Uuid,
+        id: Uuid,
+        at: u64,
+    ) -> Result<(), ApiError> {
+        let mut state = lock(&self.inner);
+        let row = state.recipients.get_mut(&id).ok_or(ApiError::NotFound)?;
+        if row.workspace_id != workspace_id {
+            return Err(ApiError::NotFound);
+        }
+        row.revoked_at = Some(at);
+        Ok(())
+    }
 }
 
 impl MemoryStore {
@@ -666,7 +803,7 @@ mod tests {
     use credentials_crypto::SealedSecret;
 
     #[tokio::test]
-    async fn writers_reject_e2e_until_that_mode_exists() {
+    async fn writers_reject_a_malformed_e2e_row() {
         let store = MemoryStore::new();
         let err = store
             .insert_version(dummy_version(WrapMode::E2e), dummy_audit())

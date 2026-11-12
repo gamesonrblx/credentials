@@ -24,7 +24,10 @@ mod recovery;
 mod xwing_kat;
 
 pub use aad::{dek_aad, payload_aad, ALG_AES_256_GCM_V1, PURPOSE_DEK, PURPOSE_PAYLOAD};
-pub use crd2::{open_e2e, seal_e2e, E2eSealed, E2E_DEK_WRAP_ALG, E2E_ENCAPSULATION_LEN};
+pub use crd2::{
+    open_e2e, seal_e2e, E2eSealed, E2E_DEK_WRAP_ALG, E2E_ENCAPSULATION_KEY_LEN,
+    E2E_ENCAPSULATION_LEN,
+};
 pub use envelope::{
     open_secret, rewrap_dek, seal_secret, OpenSecret, SealedSecret, UnwrappedKek, VersionIds,
     DEFAULT_MAX_SECRET_BYTES, DEK_WRAP_ALG, HARD_MAX_SECRET_BYTES, PAYLOAD_ALG,

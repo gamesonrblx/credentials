@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 pub const E2E_DEK_WRAP_ALG: &str = "crd2-xwing-aes-256-gcm-v1";
 pub const E2E_ENCAPSULATION_LEN: usize = 1120;
+pub const E2E_ENCAPSULATION_KEY_LEN: usize = 1216;
 
 /// Ciphertext columns for one end-to-end secret version.
 #[derive(Clone, Debug, Eq, PartialEq)]

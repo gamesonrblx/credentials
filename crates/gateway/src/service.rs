@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use credentials_crypto::{
     open_secret, random_bytes, rewrap_dek, seal_secret, DevPolicy, KekContext, OpenSecret,
     RootKeyProvider, RootKeyState, UnwrappedKek, VersionIds, DEFAULT_MAX_SECRET_BYTES,
+    E2E_DEK_WRAP_ALG, E2E_ENCAPSULATION_KEY_LEN, E2E_ENCAPSULATION_LEN, PAYLOAD_ALG,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -28,7 +29,8 @@ use crate::policy::{
     scope_allows, validate_policy, Delivery, DeliveryPolicy,
 };
 use crate::store::{
-    AgentRow, KekRow, SecretRow, SessionRow, Store, VersionRow, WorkspaceRow, WrapMode,
+    AgentRow, KekRow, RecipientRow, SecretRow, SessionRow, Store, VersionRow, WorkspaceKeyRow,
+    WorkspaceRow, WrapMode,
 };
 use crate::token::{AgentClaims, DevSigner, DEFAULT_TTL_SECS, MAX_TTL_SECS};
 use crate::upstream::{Outbound, Upstream};
@@ -148,6 +150,19 @@ pub struct InjectRequest {
 pub struct InjectResponse {
     pub upstream_status: u16,
     pub body: Vec<u8>,
+}
+
+/// Ciphertext columns for a secret the caller sealed. No plaintext field.
+pub struct E2eSubmission {
+    pub secret_id: Uuid,
+    pub version_id: Uuid,
+    pub workspace_key_id: Uuid,
+    pub payload_nonce: [u8; 12],
+    pub payload_ciphertext: Vec<u8>,
+    pub dek_wrap_nonce: [u8; 12],
+    pub dek_wrapped: Vec<u8>,
+    pub encapsulation: Vec<u8>,
+    pub plaintext_len: usize,
 }
 
 impl std::fmt::Debug for InjectResponse {
@@ -416,6 +431,153 @@ impl Gateway {
         })
     }
 
+    /// Store a secret the caller already sealed. This process does not see plaintext.
+    pub async fn store_e2e_secret(
+        &self,
+        credential: &str,
+        name: &str,
+        policy: DeliveryPolicy,
+        submitted: E2eSubmission,
+    ) -> Result<CreatedVersion, ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        self.ensure_active(&workspace)?;
+        if !valid_secret_name(name) {
+            return Err(ApiError::BadRequest);
+        }
+        validate_policy(&policy).map_err(|_| ApiError::InvalidPolicy)?;
+        if submitted.plaintext_len == 0 || submitted.plaintext_len > DEFAULT_MAX_SECRET_BYTES {
+            return Err(ApiError::PayloadTooLarge);
+        }
+        if submitted.payload_ciphertext.is_empty()
+            || submitted.dek_wrapped.is_empty()
+            || submitted.encapsulation.len() != E2E_ENCAPSULATION_LEN
+        {
+            return Err(ApiError::BadRequest);
+        }
+        let registered = self.store.workspace_key(workspace.id).await?;
+        if registered.id != submitted.workspace_key_id {
+            return Err(ApiError::BadRequest);
+        }
+        let kek_row = self.store.active_kek(workspace.id).await?;
+        let version = VersionRow {
+            id: submitted.version_id,
+            secret_id: submitted.secret_id,
+            workspace_id: workspace.id,
+            version: 1,
+            sealed: credentials_crypto::SealedSecret {
+                payload_alg: PAYLOAD_ALG.to_owned(),
+                payload_nonce: submitted.payload_nonce,
+                payload_ciphertext: submitted.payload_ciphertext,
+                dek_wrap_alg: E2E_DEK_WRAP_ALG.to_owned(),
+                dek_wrap_nonce: submitted.dek_wrap_nonce,
+                dek_wrapped: submitted.dek_wrapped,
+                plaintext_len: submitted.plaintext_len,
+            },
+            kek_id: kek_row.id,
+            wrap_mode: WrapMode::E2e,
+            e2e_encapsulation: Some(submitted.encapsulation),
+        };
+        let audit = self.audit(
+            workspace.id,
+            None,
+            "secret.write",
+            vec![
+                ("secret_id".into(), AuditValue::Uuid(submitted.secret_id)),
+                ("version_id".into(), AuditValue::Uuid(submitted.version_id)),
+                ("secret_name".into(), AuditValue::String(name.to_owned())),
+                ("wrap_mode".into(), AuditValue::String("e2e".into())),
+            ],
+        );
+        if self.store.secret_by_name(workspace.id, name).await.is_err() {
+            self.store
+                .insert_secret(
+                    SecretRow {
+                        id: submitted.secret_id,
+                        workspace_id: workspace.id,
+                        name: name.to_owned(),
+                        status: "active".to_owned(),
+                        policy,
+                    },
+                    version,
+                    audit,
+                )
+                .await?;
+            return Ok(CreatedVersion {
+                secret_id: submitted.secret_id,
+                version_id: submitted.version_id,
+                version: 1,
+            });
+        }
+        let secret = self.store.secret_by_name(workspace.id, name).await?;
+        if secret.id != submitted.secret_id {
+            return Err(ApiError::BadRequest);
+        }
+        let latest = self.store.latest_version(secret.id).await?;
+        let version_n = latest.version.checked_add(1).ok_or(ApiError::BadRequest)?;
+        let mut version = version;
+        version.secret_id = secret.id;
+        version.version = version_n;
+        self.store.insert_version(version, audit).await?;
+        Ok(CreatedVersion {
+            secret_id: secret.id,
+            version_id: submitted.version_id,
+            version: version_n,
+        })
+    }
+
+    pub async fn workspace_id_for(&self, credential: &str) -> Result<Uuid, ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        Ok(workspace.id)
+    }
+
+    pub async fn registered_key(&self, credential: &str) -> Result<WorkspaceKeyRow, ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        self.store.workspace_key(workspace.id).await
+    }
+
+    pub async fn register_workspace_key(
+        &self,
+        credential: &str,
+        encapsulation_key: &[u8],
+    ) -> Result<Uuid, ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        self.ensure_active(&workspace)?;
+        if encapsulation_key.len() != E2E_ENCAPSULATION_KEY_LEN {
+            return Err(ApiError::BadRequest);
+        }
+        let id = Uuid::now_v7();
+        self.store
+            .insert_workspace_key(WorkspaceKeyRow {
+                id,
+                workspace_id: workspace.id,
+                encapsulation_key: encapsulation_key.to_vec(),
+            })
+            .await?;
+        Ok(id)
+    }
+
+    pub async fn add_recipient(&self, credential: &str, row: RecipientRow) -> Result<(), ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        self.ensure_active(&workspace)?;
+        if row.workspace_id != workspace.id {
+            return Err(ApiError::Forbidden);
+        }
+        self.store.insert_recipient(row).await
+    }
+
+    pub async fn list_recipients(&self, credential: &str) -> Result<Vec<RecipientRow>, ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        self.store.list_recipients(workspace.id).await
+    }
+
+    pub async fn revoke_recipient(&self, credential: &str, id: Uuid) -> Result<(), ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        self.ensure_active(&workspace)?;
+        self.store
+            .revoke_recipient(workspace.id, id, self.clock.unix_nanos())
+            .await
+    }
+
     pub async fn disable_secret(&self, credential: &str, name: &str) -> Result<(), ApiError> {
         let workspace = self.authenticate_workspace(credential).await?;
         self.ensure_active(&workspace)?;
@@ -670,6 +832,11 @@ impl Gateway {
         self.ensure_anchor_fresh(workspace.id).await?;
 
         let version = self.store.latest_version(secret.id).await?;
+        if version.wrap_mode == WrapMode::E2e {
+            return self
+                .release_ciphertext(workspace.id, Some(claims.agent_id), &version)
+                .await;
+        }
         if version.wrap_mode != WrapMode::Gateway || version.e2e_encapsulation.is_some() {
             return Err(ApiError::DecryptFailed);
         }
@@ -803,6 +970,46 @@ impl Gateway {
         Ok(InjectResponse {
             upstream_status: response.status,
             body: response.body,
+        })
+    }
+
+    async fn release_ciphertext(
+        &self,
+        workspace_id: Uuid,
+        agent_id: Option<Uuid>,
+        version: &VersionRow,
+    ) -> Result<InjectResponse, ApiError> {
+        let key = self.store.workspace_key(workspace_id).await?;
+        let encapsulation = version
+            .e2e_encapsulation
+            .as_deref()
+            .ok_or(ApiError::DecryptFailed)?;
+        self.audit_or_fail(
+            workspace_id,
+            agent_id,
+            "secret.ciphertext.released",
+            vec![
+                ("version_id".into(), AuditValue::Uuid(version.id)),
+                ("wrap_mode".into(), AuditValue::String("e2e".into())),
+            ],
+        )
+        .await?;
+        let body = serde_json::json!({
+            "wrap_mode": "e2e",
+            "workspace_id": workspace_id,
+            "secret_id": version.secret_id,
+            "version_id": version.id,
+            "workspace_key_id": key.id,
+            "payload_nonce": crate::b64::b64std_encode(&version.sealed.payload_nonce),
+            "payload_ciphertext": crate::b64::b64std_encode(&version.sealed.payload_ciphertext),
+            "dek_wrap_nonce": crate::b64::b64std_encode(&version.sealed.dek_wrap_nonce),
+            "dek_wrapped": crate::b64::b64std_encode(&version.sealed.dek_wrapped),
+            "e2e_encapsulation": crate::b64::b64std_encode(encapsulation),
+            "plaintext_len": version.sealed.plaintext_len,
+        });
+        Ok(InjectResponse {
+            upstream_status: 200,
+            body: serde_json::to_vec(&body).unwrap_or_default(),
         })
     }
 

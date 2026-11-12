@@ -494,6 +494,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "credentials-injector"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "credentials-crypto",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "crossbeam-queue"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

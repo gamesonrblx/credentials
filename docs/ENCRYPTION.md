@@ -39,7 +39,7 @@ These are the choices an implementer should not relitigate in passing.
 
 ### Non-goals for v1
 
-- End-to-end / zero-knowledge mode. Section 12 specifies it so it can be added without a migration of the gateway-wrapped rows’ meaning. v1 writes `wrap_mode = gateway` only.
+- End-to-end / zero-knowledge mode for the dev gateway. Section 12 is implemented for `wrap_mode = e2e`. The dev process still opens `wrap_mode = gateway` rows and refuses `CREDENTIALS_ENV=production`. Production self-host and the hosted control plane release ciphertext and do not open it.
 - A custom cipher, KEM, combiner, MAC, or signature scheme. Allowed libraries are listed in section 4.
 - Caching plaintext, in memory beyond the request or anywhere else.
 - Caching unwrapped DEKs across requests.
@@ -115,7 +115,7 @@ In the gateway-decrypts model, the operator who can change gateway code, dump ga
 
 An operator with database access and no KMS access cannot read secrets. An operator with KMS admin access and no database access has nothing to decrypt, and a key-policy change is an alert.
 
-The mode in which the operator cannot read secrets is section 12. It is not v1, because in that mode the gateway cannot inject on its own.
+The mode in which the operator cannot read secrets is section 12. It is the production path. The control plane authorizes and releases ciphertext. The customer injector opens it. The dev process can still open `wrap_mode = gateway` rows, and that process refuses `CREDENTIALS_ENV=production`.
 
 ### KMS outage
 
@@ -941,13 +941,13 @@ What v1 does about that:
 
 Go’s FIPS 140-3 module can run TLS with `X25519MLKEM768`. A deployment that needs that module turns it on and still leaves the hybrid group enabled.
 
-## 12. Later end-to-end mode
+## 12. End-to-end mode
 
-Not in v1. Recorded here so the first schema does not block it, and so the tradeoff is explicit before anyone builds it.
+Implemented as CRD2. The dev gateway-decrypts path remains for `wrap_mode = gateway` and refuses `CREDENTIALS_ENV=production`. A hosted or self-hosted control plane releases ciphertext for `wrap_mode = e2e` and does not call `open_secret` on those rows. There is no operator recovery recipient. An attested enclave is not built; hosted injection uses the customer injector.
 
 Each workspace that turns the mode on generates, on a client the operator does not control, an X-Wing keypair (`draft-connolly-cfrg-xwing-kem-11`: 32-byte decapsulation key, 1216-byte encapsulation key). The encapsulation key is registered with the server. The decapsulation key stays on the client, encrypted at rest under a passphrase with Argon2id (RFC 9106) using parameters current at the time it is built. The server never receives the passphrase or the decapsulation key.
 
-A secret version in this mode has `wrap_mode = e2e`. The DEK is not wrapped by the tenant KEK. It is wrapped by X-Wing encapsulation to the client key: the X-Wing ciphertext (1120 bytes) is stored in `e2e_encapsulation`, and the 32-byte X-Wing shared secret is the AES-256-GCM key that wraps the DEK (or is the DEK, if the implementer uses it directly as the 32-byte AES key; pick one when building it and write it down as `CRD2`). The server stores ciphertext it cannot open.
+A secret version in this mode has `wrap_mode = e2e`. The DEK is not wrapped by the tenant KEK. CRD2 picks the wrap, not the shared-secret-as-DEK option: X-Wing encapsulation to the client key stores the 1120-byte ciphertext in `e2e_encapsulation`, and the 32-byte shared secret is the AES-256-GCM key that wraps a random 32-byte DEK. The payload associated data is the CRD1 layout with magic `CRD2`. The DEK-wrap associated data uses magic `CRD2`, the workspace-key id in place of a KEK id, and generation `1`. `dek_wrap_alg` is `crd2-xwing-aes-256-gcm-v1`. The server stores ciphertext it cannot open. `kek_id` stays populated because the schema requires a KEK row; it is not the wrapping key.
 
 Consequences, which are the product:
 
@@ -956,7 +956,7 @@ Consequences, which are the product:
 - Losing the decapsulation key without a recovery path loses the secrets. A recovery encapsulation key (a second X-Wing recipient, created at enrollment and held offline) is the likely answer and is not designed here.
 - Moving an existing gateway-wrapped secret into this mode requires the plaintext once: the client decrypts through the gateway, rewraps to the client key, and then the gateway-wrapped DEK row is replaced. That one read is visible in the audit log. After it, the operator cannot read that version.
 
-v1 still creates the tenant root key and the KEK for every workspace, including a workspace that might later enable this mode. Gateway-wrapped and end-to-end versions can coexist in one workspace during a migration. `e2e_encapsulation` stays NULL until then. Writers must reject `wrap_mode = e2e` until the mode is actually implemented, so a client cannot store a blob nobody can unwrap.
+The dev path still creates a tenant root key and a KEK for every workspace. Gateway-wrapped and end-to-end versions can coexist. Writers accept `wrap_mode = e2e` only when the encapsulation is 1120 bytes and the wrap label is the CRD2 label. A malformed row is rejected. Recovery of the workspace decapsulation key is account-bound: a device, a WebAuthn PRF output, an offline Argon2id kit, or a teammate. The control plane stores those wraps and has no operator recipient. Losing every recipient loses the data.
 
 ## 13. Open core and implementation rules
 

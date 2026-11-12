@@ -40,11 +40,11 @@ pub use local::{peer_uid_allowed, serve_local};
 pub use policy::{Delivery, DeliveryPolicy};
 pub use redact::redact_field;
 pub use service::{
-    generate_dpop, Clock, CreatedSession, Gateway, InjectRequest, InjectResponse, ManualClock, Now,
-    ISSUER,
+    generate_dpop, Clock, CreatedSession, E2eSubmission, Gateway, InjectRequest, InjectResponse,
+    ManualClock, Now, ISSUER,
 };
 pub use sql_store::SqlStore;
-pub use store::{MemoryStore, Store, WrapMode};
+pub use store::{MemoryStore, RecipientRow, Store, WrapMode};
 pub use token::DevSigner;
 pub use upstream::{HttpUpstream, Outbound, RecordingUpstream, UnconfiguredUpstream, Upstream};
 

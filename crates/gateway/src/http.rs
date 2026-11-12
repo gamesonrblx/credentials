@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::policy::{Delivery, DeliveryPolicy};
-use crate::service::{CreatedSession, CreatedVersion, CreatedWorkspace, Gateway, InjectRequest};
+use crate::service::{
+    CreatedSession, CreatedVersion, CreatedWorkspace, E2eSubmission, Gateway, InjectRequest,
+};
+use crate::store::RecipientRow;
 use crate::ApiError;
 
 #[derive(Clone)]
@@ -64,6 +67,19 @@ fn routes() -> Router<AppState> {
         .route("/v1/kek/rotate", post(rotate_kek))
         .route("/v1/workspaces/{id}/deletion", post(delete_workspace))
         .route("/v1/workspaces/{id}/deletion/cancel", post(cancel_deletion))
+        .route(
+            "/v1/workspace-keys",
+            post(register_workspace_key).get(get_workspace_key),
+        )
+        .route(
+            "/v1/recovery-recipients",
+            post(add_recipient).get(list_recipients),
+        )
+        .route(
+            "/v1/recovery-recipients/{id}/revoke",
+            post(revoke_recipient),
+        )
+        .route("/v1/e2e-secrets", post(store_e2e_secret))
 }
 
 async fn health() -> StatusCode {
@@ -449,6 +465,188 @@ async fn delete_workspace(
         .delete_workspace(bearer(&headers)?, id)
         .await?;
     Ok(StatusCode::ACCEPTED)
+}
+
+#[derive(Deserialize)]
+struct WorkspaceKeyBody {
+    encapsulation_key: String,
+}
+
+#[derive(Serialize)]
+struct WorkspaceKeyResponse {
+    id: Uuid,
+    encapsulation_key: String,
+}
+
+async fn register_workspace_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WorkspaceKeyBody>,
+) -> Result<Json<WorkspaceKeyResponse>, ApiError> {
+    let key = b64std_decode(&body.encapsulation_key)?;
+    let id = state
+        .gateway
+        .register_workspace_key(bearer(&headers)?, &key)
+        .await?;
+    Ok(Json(WorkspaceKeyResponse {
+        id,
+        encapsulation_key: body.encapsulation_key,
+    }))
+}
+
+async fn get_workspace_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<WorkspaceKeyResponse>, ApiError> {
+    let key = state.gateway.registered_key(bearer(&headers)?).await?;
+    Ok(Json(WorkspaceKeyResponse {
+        id: key.id,
+        encapsulation_key: b64std_encode(&key.encapsulation_key),
+    }))
+}
+
+#[derive(Deserialize)]
+struct RecipientBody {
+    id: Uuid,
+    kind: String,
+    encapsulation_key: Option<String>,
+    encapsulation: Option<String>,
+    prf_salt: Option<String>,
+    kdf_params: Option<String>,
+    wrap_nonce: String,
+    wrapped_key: String,
+}
+
+#[derive(Serialize)]
+struct RecipientResponse {
+    id: Uuid,
+    kind: String,
+    revoked_at: Option<u64>,
+}
+
+async fn add_recipient(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RecipientBody>,
+) -> Result<StatusCode, ApiError> {
+    let credential = bearer(&headers)?;
+    let row = recipient_row(credential, &state, body).await?;
+    state.gateway.add_recipient(credential, row).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn recipient_row(
+    credential: &str,
+    state: &AppState,
+    body: RecipientBody,
+) -> Result<RecipientRow, ApiError> {
+    let workspace_id = state.gateway.workspace_id_for(credential).await?;
+    Ok(RecipientRow {
+        id: body.id,
+        workspace_id,
+        kind: body.kind,
+        encapsulation_key: optional_b64(body.encapsulation_key)?,
+        encapsulation: optional_b64(body.encapsulation)?,
+        prf_salt: optional_b64(body.prf_salt)?,
+        kdf_params: body.kdf_params,
+        wrap_nonce: b64std_decode(&body.wrap_nonce)?,
+        wrapped_key: b64std_decode(&body.wrapped_key)?,
+        revoked_at: None,
+    })
+}
+
+fn optional_b64(value: Option<String>) -> Result<Option<Vec<u8>>, ApiError> {
+    value.map(|text| b64std_decode(&text)).transpose()
+}
+
+async fn list_recipients(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<RecipientResponse>>, ApiError> {
+    let rows = state.gateway.list_recipients(bearer(&headers)?).await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| RecipientResponse {
+                id: row.id,
+                kind: row.kind,
+                revoked_at: row.revoked_at,
+            })
+            .collect(),
+    ))
+}
+
+async fn revoke_recipient(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .gateway
+        .revoke_recipient(bearer(&headers)?, id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct E2eBody {
+    name: String,
+    value: Option<String>,
+    secret_id: Uuid,
+    version_id: Uuid,
+    workspace_key_id: Uuid,
+    payload_nonce: String,
+    payload_ciphertext: String,
+    dek_wrap_nonce: String,
+    dek_wrapped: String,
+    e2e_encapsulation: String,
+    plaintext_len: usize,
+    policy: PolicyBody,
+}
+
+async fn store_e2e_secret(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<E2eBody>,
+) -> Result<Json<VersionResponse>, ApiError> {
+    if body.value.is_some() {
+        return Err(ApiError::BadRequest);
+    }
+    let created = state
+        .gateway
+        .store_e2e_secret(
+            bearer(&headers)?,
+            &body.name,
+            DeliveryPolicy {
+                header_name: body.policy.header_name,
+                header_format: body.policy.header_format,
+                env_name: body.policy.env_name,
+                hosts: body.policy.hosts,
+                allow_proxy: body.policy.allow_proxy,
+                allow_header: body.policy.allow_header,
+                allow_env: body.policy.allow_env,
+            },
+            E2eSubmission {
+                secret_id: body.secret_id,
+                version_id: body.version_id,
+                workspace_key_id: body.workspace_key_id,
+                payload_nonce: arr12(b64std_decode(&body.payload_nonce)?)?,
+                payload_ciphertext: b64std_decode(&body.payload_ciphertext)?,
+                dek_wrap_nonce: arr12(b64std_decode(&body.dek_wrap_nonce)?)?,
+                dek_wrapped: b64std_decode(&body.dek_wrapped)?,
+                encapsulation: b64std_decode(&body.e2e_encapsulation)?,
+                plaintext_len: body.plaintext_len,
+            },
+        )
+        .await?;
+    Ok(Json(VersionResponse {
+        secret_id: created.secret_id,
+        version_id: created.version_id,
+        version: created.version,
+    }))
+}
+
+fn arr12(bytes: Vec<u8>) -> Result<[u8; 12], ApiError> {
+    bytes.try_into().map_err(|_| ApiError::BadRequest)
 }
 
 fn bearer(headers: &HeaderMap) -> Result<&str, ApiError> {

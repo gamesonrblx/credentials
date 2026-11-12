@@ -1,0 +1,19 @@
+[package]
+name = "credentials-injector"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Customer-run injector. Holds the workspace decapsulation key and opens CRD2 grants."
+
+[[bin]]
+name = "credentials-injector"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.23.1"
+credentials-crypto = { path = "../crypto" }
+serde_json = "1.0.154"
+uuid = { version = "1.26.1", features = ["v7"] }

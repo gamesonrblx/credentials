@@ -21,8 +21,8 @@ use uuid::Uuid;
 use crate::audit::{commit_event, AuditDraft, AuditRecord, AuditValue};
 use crate::policy::DeliveryPolicy;
 use crate::store::{
-    ensure_gateway, AgentRow, CheckpointRow, KekRow, SecretRow, SessionRow, Store, VersionRow,
-    WorkspaceRow, WrapMode,
+    ensure_recipient, ensure_stored, AgentRow, CheckpointRow, KekRow, RecipientRow, SecretRow,
+    SessionRow, Store, VersionRow, WorkspaceKeyRow, WorkspaceRow, WrapMode,
 };
 use crate::ApiError;
 
@@ -639,7 +639,7 @@ impl Store for SqlStore {
         version: VersionRow,
         audit: AuditDraft,
     ) -> Result<(), ApiError> {
-        ensure_gateway(version.wrap_mode, version.e2e_encapsulation.as_deref())?;
+        ensure_stored(&version)?;
         let mut tx = self.begin().await?;
         append_tx(&mut tx, audit).await?;
         let created = now_nanos();
@@ -660,7 +660,7 @@ impl Store for SqlStore {
     }
 
     async fn insert_version(&self, version: VersionRow, audit: AuditDraft) -> Result<(), ApiError> {
-        ensure_gateway(version.wrap_mode, version.e2e_encapsulation.as_deref())?;
+        ensure_stored(&version)?;
         let mut tx = self.begin().await?;
         append_tx(&mut tx, audit).await?;
         insert_version_tx(&mut tx, &version, now_nanos()).await?;
@@ -994,6 +994,133 @@ impl Store for SqlStore {
                     .await
                     .map_err(map_db)?;
                 rows.iter().map(|row| session_from!(row)).collect()
+            }
+        )
+    }
+
+    async fn insert_workspace_key(&self, row: WorkspaceKeyRow) -> Result<(), ApiError> {
+        if row.encapsulation_key.len() != credentials_crypto::E2E_ENCAPSULATION_KEY_LEN {
+            return Err(ApiError::BadRequest);
+        }
+        let created = now_nanos();
+        on_pool!(
+            self,
+            "INSERT INTO workspace_keys (id, workspace_id, encapsulation_key, created_at) VALUES (?, ?, ?, ?)",
+            |db, q| {
+                sqlx::query(q)
+                    .bind(row.id)
+                    .bind(row.workspace_id)
+                    .bind(row.encapsulation_key.as_slice())
+                    .bind(created)
+                    .execute(db)
+                    .await
+                    .map_err(map_db)?;
+                Ok(())
+            }
+        )
+    }
+
+    async fn workspace_key(&self, workspace_id: Uuid) -> Result<WorkspaceKeyRow, ApiError> {
+        on_pool!(
+            self,
+            "SELECT id, workspace_id, encapsulation_key FROM workspace_keys WHERE workspace_id = ?",
+            |db, q| {
+                let row = sqlx::query(q)
+                    .bind(workspace_id)
+                    .fetch_optional(db)
+                    .await
+                    .map_err(map_db)?
+                    .ok_or(ApiError::NotFound)?;
+                Ok(WorkspaceKeyRow {
+                    id: row.try_get("id").map_err(map_db)?,
+                    workspace_id: row.try_get("workspace_id").map_err(map_db)?,
+                    encapsulation_key: row.try_get("encapsulation_key").map_err(map_db)?,
+                })
+            }
+        )
+    }
+
+    async fn insert_recipient(&self, row: RecipientRow) -> Result<(), ApiError> {
+        ensure_recipient(&row)?;
+        let created = now_nanos();
+        on_pool!(
+            self,
+            "INSERT INTO recovery_recipients (id, workspace_id, kind, encapsulation_key, encapsulation, prf_salt, kdf_params, wrap_nonce, wrapped_key, created_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            |db, q| {
+                sqlx::query(q)
+                    .bind(row.id)
+                    .bind(row.workspace_id)
+                    .bind(&row.kind)
+                    .bind(row.encapsulation_key.as_deref())
+                    .bind(row.encapsulation.as_deref())
+                    .bind(row.prf_salt.as_deref())
+                    .bind(&row.kdf_params)
+                    .bind(row.wrap_nonce.as_slice())
+                    .bind(row.wrapped_key.as_slice())
+                    .bind(created)
+                    .bind(row.revoked_at.map(|at| i64::try_from(at).unwrap_or(0)))
+                    .execute(db)
+                    .await
+                    .map_err(map_db)?;
+                Ok(())
+            }
+        )
+    }
+
+    async fn list_recipients(&self, workspace_id: Uuid) -> Result<Vec<RecipientRow>, ApiError> {
+        on_pool!(
+            self,
+            "SELECT id, workspace_id, kind, encapsulation_key, encapsulation, prf_salt, kdf_params, wrap_nonce, wrapped_key, revoked_at FROM recovery_recipients WHERE workspace_id = ?",
+            |db, q| {
+                let rows = sqlx::query(q)
+                    .bind(workspace_id)
+                    .fetch_all(db)
+                    .await
+                    .map_err(map_db)?;
+                rows.iter()
+                    .map(|row| {
+                        let revoked: Option<i64> = row.try_get("revoked_at").map_err(map_db)?;
+                        Ok(RecipientRow {
+                            id: row.try_get("id").map_err(map_db)?,
+                            workspace_id: row.try_get("workspace_id").map_err(map_db)?,
+                            kind: row.try_get("kind").map_err(map_db)?,
+                            encapsulation_key: row.try_get("encapsulation_key").map_err(map_db)?,
+                            encapsulation: row.try_get("encapsulation").map_err(map_db)?,
+                            prf_salt: row.try_get("prf_salt").map_err(map_db)?,
+                            kdf_params: row.try_get("kdf_params").map_err(map_db)?,
+                            wrap_nonce: row.try_get("wrap_nonce").map_err(map_db)?,
+                            wrapped_key: row.try_get("wrapped_key").map_err(map_db)?,
+                            revoked_at: revoked.map(u64_from).transpose()?,
+                        })
+                    })
+                    .collect()
+            }
+        )
+    }
+
+    async fn revoke_recipient(
+        &self,
+        workspace_id: Uuid,
+        id: Uuid,
+        at: u64,
+    ) -> Result<(), ApiError> {
+        let stamped = i64::try_from(at).map_err(|_| ApiError::StoreUnavailable)?;
+        on_pool!(
+            self,
+            "UPDATE recovery_recipients SET revoked_at = ? WHERE id = ? AND workspace_id = ?",
+            |db, q| {
+                let result = sqlx::query(q)
+                    .bind(stamped)
+                    .bind(id)
+                    .bind(workspace_id)
+                    .execute(db)
+                    .await
+                    .map_err(map_db)?;
+                if result.rows_affected() == 0 {
+                    Err(ApiError::NotFound)
+                } else {
+                    Ok(())
+                }
             }
         )
     }
