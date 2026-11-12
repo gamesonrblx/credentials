@@ -75,7 +75,7 @@ macro_rules! workspace_from {
 macro_rules! kek_from {
     ($row:expr) => {{
         let wrapped: Option<Vec<u8>> = $row.try_get("wrapped_kek").map_err(map_db)?;
-        let version: i64 = $row.try_get("version").map_err(map_db)?;
+        let version: i32 = $row.try_get("version").map_err(map_db)?;
         Ok(KekRow {
             id: $row.try_get("id").map_err(map_db)?,
             workspace_id: $row.try_get("workspace_id").map_err(map_db)?,
@@ -108,8 +108,8 @@ macro_rules! secret_from {
 }
 macro_rules! version_from {
     ($row:expr) => {{
-        let version: i64 = $row.try_get("version").map_err(map_db)?;
-        let len: i64 = $row.try_get("plaintext_len").map_err(map_db)?;
+        let version: i32 = $row.try_get("version").map_err(map_db)?;
+        let len: i32 = $row.try_get("plaintext_len").map_err(map_db)?;
         let mode: String = $row.try_get("wrap_mode").map_err(map_db)?;
         Ok(VersionRow {
             id: $row.try_get("id").map_err(map_db)?,
@@ -213,6 +213,9 @@ fn map_db(err: sqlx::Error) -> ApiError {
         if db.is_foreign_key_violation() {
             return ApiError::NotFound;
         }
+        tracing::error!(code = ?db.code(), "store request failed");
+    } else {
+        tracing::error!("store request failed");
     }
     ApiError::StoreUnavailable
 }
@@ -279,7 +282,7 @@ impl SqlStore {
                 .map_err(|_| ApiError::StoreUnavailable)?
                 .create_if_missing(true)
                 .foreign_keys(true)
-                .journal_mode(SqliteJournalMode::Wal)
+                .journal_mode(SqliteJournalMode::Delete)
                 .synchronous(SqliteSynchronous::Full)
                 .busy_timeout(Duration::from_secs(5));
             let pool = SqlitePoolOptions::new()
@@ -521,7 +524,7 @@ impl Store for SqlStore {
                     .fetch_one(db)
                     .await
                     .map_err(map_db)?;
-                let version: i64 = row.try_get("version").map_err(map_db)?;
+                let version: i32 = row.try_get("version").map_err(map_db)?;
                 u32::try_from(version.saturating_add(1)).map_err(|_| ApiError::StoreUnavailable)
             }
         )
@@ -826,7 +829,7 @@ async fn insert_kek_tx(tx: &mut SqlTx<'_>, kek: &KekRow, created: i64) -> Result
             sqlx::query(q)
                 .bind(kek.id)
                 .bind(kek.workspace_id)
-                .bind(i64::from(kek.version))
+                .bind(i32::try_from(kek.version).map_err(|_| ApiError::StoreUnavailable)?)
                 .bind(&kek.status)
                 .bind(kek.wrapped_kek.as_slice())
                 .bind(&kek.kms_key_ref)
@@ -879,7 +882,7 @@ async fn insert_version_tx(
                 .bind(version.id)
                 .bind(version.secret_id)
                 .bind(version.workspace_id)
-                .bind(i64::from(version.version))
+                .bind(i32::try_from(version.version).map_err(|_| ApiError::StoreUnavailable)?)
                 .bind(&version.sealed.payload_alg)
                 .bind(version.sealed.payload_nonce.as_slice())
                 .bind(version.sealed.payload_ciphertext.as_slice())
@@ -889,7 +892,7 @@ async fn insert_version_tx(
                 .bind(version.kek_id)
                 .bind(version.wrap_mode.as_str())
                 .bind(version.e2e_encapsulation.as_deref())
-                .bind(i64::try_from(version.sealed.plaintext_len).unwrap_or(i64::MAX))
+                .bind(i32::try_from(version.sealed.plaintext_len).unwrap_or(i32::MAX))
                 .bind(created)
                 .execute(&mut **db)
                 .await

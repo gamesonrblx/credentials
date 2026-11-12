@@ -2,6 +2,11 @@
 version = 2
 yanked = "deny"
 unmaintained = "workspace"
+# sqlx 0.8 pins libsqlite3-sys 0.30.1. The patched release is 0.39, which
+# that pin cannot take. The bundled copy is what Windows and macOS CI link.
+# The gateway creates its own database and does not open WAL mode, which is
+# the condition in RUSTSEC-2026-0459. Drop this ignore when sqlx moves up.
+ignore = ["RUSTSEC-2026-0459"]
 
 [licenses]
 version = 2
