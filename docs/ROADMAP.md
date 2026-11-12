@@ -56,7 +56,7 @@ Infisical, Doppler, and 1Password tests use recorded HTTP shapes.
 They do not call the paid vendor APIs.
 There is no real Nitro hardware path.
 `credentials-edge` checks a test PCR document.
-`verify_attestation` checks a `COSE_Sign1` document, ES384, and the certificate chain to a root the caller pins. CI signs that document with a test root. An EIF still needs the Nitro CLI on a Nitro host.
+`verify_attestation` checks a `COSE_Sign1` document, ES384, and the certificate chain to a root the caller pins. It reads the bundle root first, as AWS orders it. It checks validity dates, CA constraints, the listed PCRs, the document age, and an optional nonce. CI signs that document with a test root. An EIF still needs the Nitro CLI on a Nitro host.
 An EIF build needs Nitro hardware.
 Vault Transit and AWS KMS adapters are in `credentials-edge`.
 A customer process or a dev process can call those adapters.

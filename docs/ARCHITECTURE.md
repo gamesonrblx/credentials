@@ -249,7 +249,8 @@ Order on the allowed path: agent token, DPoP, scope check, audit append, decrypt
 The token check and the unwrap are separate functions.
 They run in the same dev-gateway process.
 That process sees plaintext between decrypt and the upstream call.
-A failed DPoP proof, a replayed DPoP `jti`, or a disabled agent returns 401 before any audit append.
+A disabled agent returns 401 before any audit append.
+A failed DPoP proof or a replayed DPoP `jti` appends `secret.access.denied` with reason `dpop` and then returns 401.
 Those paths skip decrypt too.
 Scope, host, revocation, and policy denials append `secret.access.denied` first.
 `cargo run` uses an HTTPS upstream client.
@@ -291,7 +292,8 @@ sequenceDiagram
   else allowed
     Control->>Store: Append secret.access.allowed
     Control->>Store: Read ciphertext, encapsulation, and policy
-    Control-->>Injector: Ciphertext, encapsulation, and policy
+    Control-->>Injector: Ciphertext, encapsulation, and a signed grant
+    Injector->>Injector: Verify the grant signature, the expiry, and the delivery fields
     Injector->>Injector: X-Wing decapsulate, unwrap the data key, open the payload
     Injector->>Injector: Inject into the runtime or the upstream call
     Note over Control,Injector: The control plane has no decapsulation key
@@ -579,7 +581,9 @@ A stolen token together with its DPoP key can call inject inside its scope until
 That use calls the dev gateway or requests a ciphertext release. The audit log records it.
 It is not offline decryption.
 
-The handler builds DPoP `htu` from the host header and the TLS flag.
+The handler builds DPoP `htu` from `CREDENTIALS_PUBLIC_URL` and the request path.
+Production requires that variable.
+A dev gateway without it uses the host header and the TLS flag.
 It does not read `x-dpop-htu`.
 The verifier checks the `htu` value it receives.
 
@@ -668,7 +672,7 @@ There is no live hosted service.
 | Operator | The operator reads the database. The dev gateway decrypts `wrap_mode=gateway`. A reader of that process can read plaintext while it serves traffic. A reader of its memory, its code, or `.credentials-dev-keys.json` can do the same. The production guard rejects this provider. It does not hide plaintext from an operator who runs the dev gateway. | The operator reads ciphertext, policy, secret names, wrapped workspace-key blobs, public encapsulation keys, PRF salts, tokens, and audit metadata. The operator does not receive the workspace key, a device decapsulation key, a PRF output, or the recovery kit. Tactico, when hosting, is this operator. No hosted mode decrypts. |
 | Compromised database | The database holds ciphertext, nonces, wrapped data keys, and wrapped KEKs. It also holds key ids, names, policy, credential hashes, and the audit chain. The tenant root key is not in the database. A swapped row fails AES-GCM because CRD1 binds the workspace, the secret, and the version. `wrap_mode=gateway` plaintext also needs the dev key file or a KMS decrypt role. An e2e row needs a customer recipient. | The database holds the same payload ciphertext, plus recipient wraps of the workspace key. Those wraps open only with a customer recipient. A dump plus control-plane credentials is not enough. |
 | Compromised host | The dev host sees plaintext, data keys, and cached KEKs in process memory. The KEK cache TTL is 60 seconds. This host is the operator host for the dev gateway. | The control-plane host sees the database rows and not the opened secret. The injector host sees plaintext of secrets it opens. That host belongs to the customer. An enclave parent would see the host-side process. The workspace key would enter only an image whose measurement matches the pin. A wrong measurement gets no key. This trusts the CPU vendor and the pin. A crash dump of enclave memory would break the claim. A host-visible swap of that memory would break the claim. The enclave image must not use either one. That enclave path is not live. |
-| Agent | On proxy injection, the agent sees the upstream response. The dev gateway sets the secret on the upstream request. The public listener rejects env and header delivery. A compromised agent can cause calls inside its scope until the session ends. It does not receive a data key or a KEK. The runtime must exclude echoed tool output from the prompt. Credentials does not write the model context. | The injector performs the same delivery split. Proxy remains the default for an API key. Env delivery is only on the local channel. It places a secret where a process that can read its environment can copy it. An agent that is not the injector does not receive a proxy secret. |
+| Agent | On proxy injection, the agent sees the upstream response. The dev gateway sets the secret on the upstream request. The public listener rejects env and header delivery. A compromised agent can cause calls inside its scope until the session ends. It does not receive a data key or a KEK. The runtime must exclude echoed tool output from the prompt. Credentials does not write the model context. | The injector enforces the signed grant. For proxy it makes the upstream call itself and returns only the response. Proxy remains the default for an API key. Env delivery is only on the local channel. It places a secret where a process that can read its environment can copy it. An agent that is not the injector does not receive a proxy secret. |
 
 A network attacker can see and change public traffic. With no token and no DPoP key, that attacker gets no plaintext and no usable session.
 The dev loopback listener can be cleartext.
@@ -709,8 +713,8 @@ The encryption spec remains normative for the envelope.
 - Import HTTP readers for Infisical, Doppler, 1Password Connect, and Vault KV exist in `credentials-edge`. The integration job calls Vault KV. Infisical, Doppler, and 1Password stay on local fixtures. Inject does not fetch those products. The injector seals a native version and discards the source bytes.
 - The public API is client-agnostic. The in-tree client is `credentials-client`.
 - `wrap_mode` and `e2e_encapsulation` exist. `wrap_mode=e2e` stores CRD2. The production control plane does not open those rows. `credentials-injector` opens them.
-- DPoP `htu` comes from the request host and the TLS flag. The handler does not read `x-dpop-htu`. The migration creates `revoked_jtis`. The gateway code does not read that table yet. A disabled agent, a failed DPoP proof, or a replayed DPoP `jti` returns 401 without an audit row. `secret.access.delivered` and `secret.access.failed` ignore an append error. The allow event does not.
-- Workspace delete revokes sessions, deletes secret rows, and schedules shred. A poller sets `shredded`. Cancel exists while destruction is pending. The migration creates `rewrap_jobs`. KEK rotation rewraps data keys in the gateway process.
+- DPoP `htu` comes from `CREDENTIALS_PUBLIC_URL`. A dev gateway without that variable uses the request host and the TLS flag. The handler does not read `x-dpop-htu`. The migration creates `revoked_jtis`. Inject reads that table. A disabled agent returns 401 without an audit row. A failed DPoP proof or a replayed DPoP `jti` appends `secret.access.denied` first. `secret.access.delivered` and `secret.access.failed` ignore an append error. The allow event does not.
+- Workspace delete revokes sessions. The dev gateway deletes secret rows and schedules shred. The production control plane holds no root key, so it stores a deadline, keeps the ciphertext for 7 days, and then deletes it. A poller sets `shredded`. Cancel exists while destruction is pending. The migration creates `rewrap_jobs`. KEK rotation rewraps data keys in the gateway process.
 - The public listener rejects `env` and `header`. The local socket (`CREDENTIALS_LOCAL_DIR`, mode `0700`, same-uid peer check) returns `{ env_name, value }` or `{ header_name, value }`. It does not forward header delivery through `Upstream`.
 - `credentials-edge` has Vault Transit, AWS KMS, a WebAuthn software authenticator, and OIDC PKCE helpers. `Gateway::control_plane` does not call the KMS adapters. SAML is not implemented. The dashboard HTML does not decrypt. There is no live hosted service. The integration job puts one compliance-mode object in MinIO. It does not call AWS S3. There is no Nitro EIF. `credentials-edge` verifies a `COSE_Sign1` ES384 document against a caller-pinned root. CI uses a test root, not a live enclave. PKCS#11 is not in the tree. The production signer is still a `DevSigner` argument on `Gateway::control_plane`.
 
