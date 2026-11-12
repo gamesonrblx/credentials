@@ -6,5 +6,5 @@ members = ["crates/crypto", "crates/gateway", "crates/client"]
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.89"
-repository = "https://github.com/gamesonrblx/credentials"
+repository = "https://github.com/tacticocc/credentials"
 publish = false
