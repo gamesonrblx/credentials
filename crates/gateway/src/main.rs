@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use credentials_crypto::{DevFileRootKeys, DevPolicy};
 use credentials_gateway::{
-    serve, Clock, DevFileAnchor, DevSigner, Gateway, SqlStore, UnconfiguredUpstream,
+    serve, Clock, DevFileAnchor, DevSigner, Gateway, HttpUpstream, SqlStore,
 };
 
 #[tokio::main]
@@ -78,7 +78,10 @@ async fn main() {
     let gateway = match Gateway::with_anchor(
         store,
         kms,
-        Arc::new(UnconfiguredUpstream),
+        Arc::new(HttpUpstream::new().unwrap_or_else(|err| {
+            eprintln!("upstream client: {err}");
+            std::process::exit(1);
+        })),
         Arc::new(Clock),
         signer,
         anchor,

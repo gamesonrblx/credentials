@@ -7,8 +7,7 @@ Agent-native secrets provider by Tactico. You can't commit your `.env`, and you 
 - **Scoped, short-lived keys per agent run.** Each agent session (Claude, Codex, Grok, Devin and others) gets credentials scoped to one project and one task, which expire when the run ends.
 - **Injected at runtime, never in context.** Secrets are swapped in at the process or gateway layer, so they never show up in prompts, transcripts or model memory.
 - **Audit trail.** A log of which agent used which key, when, and for what task.
-- **Import what you have.** Start from an existing `.env` file.
-- **Bring your own backend.** Teams can keep secrets in Infisical, 1Password or Doppler, with Credentials acting as the agent-facing layer.
+- **Import what you have.** A team brings a secret in once, from a `.env` file or another store. Credentials keeps the value under its own envelope. It does not fetch Infisical, 1Password, or Doppler at inject time.
 
 ## Architecture principle
 
@@ -55,4 +54,4 @@ cargo run -p credentials-gateway
 
 ## What is still stubbed
 
-Cloud KMS and HSM adapters, TLS with the hybrid `X25519MLKEM768` group, the end-to-end mode, external backends (Infisical, 1Password, Doppler), a durable database, and human login. The binary's upstream client is unconfigured, so proxy injection from `cargo run` returns an upstream error. Tests supply a recording upstream.
+Cloud KMS and HSM adapters, TLS with the hybrid `X25519MLKEM768` group, the end-to-end mode, one-shot import, and human login. The dev gateway stores ciphertext in SQLite (or Postgres when `CREDENTIALS_DATABASE_URL` points there) and can proxy-inject to an allow-listed HTTPS host. It still decrypts in process. That is not the production trust model.

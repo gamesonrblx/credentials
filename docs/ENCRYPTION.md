@@ -1,6 +1,6 @@
 # Encryption and key management
 
-Status: implementation spec. No code in this repository implements it yet.
+Status: implementation spec. The envelope, the dev root-key provider, tokens, injection, and the hash-chained audit log are implemented in Rust in this repository. This file remains the spec. It makes no claim of customers, SOC 2, or any certification.
 Audience: the person building Credentials.
 Language: “must”, “must not”, and “required” are normative. “Should” is a recommendation that an implementer may deviate from only with a written reason in the PR.
 
@@ -46,7 +46,7 @@ These are the choices an implementer should not relitigate in passing.
 - Sharing unwrapped KEKs across nodes, through Redis, or through any store other than the process that called the KMS.
 - Multi-region active-active KMS. v1 is single-region. The KMS is a hard availability dependency.
 - Human identity, SSO, and the dashboard. Workspace credentials below are the bootstrap admin credential only.
-- Encrypting data that stays in Infisical, 1Password, or Doppler. Those are backends the gateway can read at injection time. Values fetched from them are not written to the Credentials database.
+- A live connection to Infisical, 1Password, or Doppler at injection time. A team imports a secret once. Credentials stores that value under the native envelope. Zero-knowledge against the operator is required for a production deployment and is not what the current gateway does. The current process decrypts. Production self-host and any hosted deployment must not.
 
 ## 3. Threat model
 
@@ -143,7 +143,7 @@ A single-region KMS is a single point of failure. That is accepted in v1. Availa
 
 ## 4. Cryptography and libraries
 
-All of this runs in the gateway process unless a sentence says otherwise. The reference language is Go 1.24 or newer, because the standard library already contains AES-GCM, ML-KEM, and the TLS hybrid group. Another language is allowed only if it passes the same test vectors and uses libraries of the same class. Do not split the cryptographic core across languages.
+All of this runs in the gateway process unless a sentence says otherwise. Rust is the implementation language of record. The Go notes in this section are guidance for the hosted and self-hosted TLS stack, not a second codebase. An implementation must pass the same test vectors and use libraries of the same class. Do not split the cryptographic core across languages.
 
 Randomness is `crypto/rand` only. If the read fails, the request fails. `math/rand` must not be used for keys, nonces, tokens, or ids.
 
@@ -923,11 +923,11 @@ sequenceDiagram
 
 On a KMS or GCM failure after the allow event, the gateway appends `secret.access.failed`, wipes buffers, and returns 503 or 500 as in the table. It does not call the upstream.
 
-### External secret backends
+### Import, not a live backend
 
-A secret may be a reference to Infisical, 1Password, or Doppler instead of an envelope-encrypted value. Store the backend type and the external id. Do not store the fetched plaintext. At inject time, fetch it with a backend credential that is itself an envelope-encrypted Credentials secret, apply the same delivery policy and the same audit events, and wipe the value. The external product’s encryption is its own. This document covers what Credentials stores and what it does with the value in memory.
+Credentials stores the secret itself. A team moves a value in once, from Infisical, 1Password, Doppler, Vault, or a `.env` file. The import seals a native secret version under the envelope and discards the source bytes. Injection then uses only that ciphertext. The gateway does not call those products at inject time, and it does not keep a backend credential for them.
 
-Importing a `.env` file creates one envelope-encrypted secret version per key, then discards the source bytes.
+The import tool is not in this tree yet. Until it is, the gateway only opens values that were sealed here. A failed import must not leave plaintext on the control plane.
 
 ## 11. Post-quantum posture
 

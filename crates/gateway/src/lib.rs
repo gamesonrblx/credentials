@@ -40,7 +40,7 @@ pub use service::{
 pub use sql_store::SqlStore;
 pub use store::{MemoryStore, Store, WrapMode};
 pub use token::DevSigner;
-pub use upstream::{RecordingUpstream, UnconfiguredUpstream, Upstream};
+pub use upstream::{HttpUpstream, Outbound, RecordingUpstream, UnconfiguredUpstream, Upstream};
 
 use std::net::SocketAddr;
 use std::sync::Arc;

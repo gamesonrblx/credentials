@@ -47,9 +47,9 @@ flowchart TB
 | Agent or runtime | **Implemented.** `credentials-client` speaks plain HTTP to a loopback gateway and attaches DPoP proofs on inject. | Any agent platform or runtime uses the same public API. Nothing in the API is specific to one product. **Planned (M2)** for the stable, documented surface. **Planned (M4)** for TLS. |
 | Public API and control plane | **Implemented.** One Axum process is both the API and the decryptor. `POST /v1/workspaces` on this listener is unauthenticated so a local process can bootstrap. Issuer is fixed at `https://credentials.local/v1`. | The control plane stores ciphertext, policy, tokens, and audit. It does not hold a key that opens secrets. Authenticated bootstrap is **planned (M2)**. The production split is **planned (M3)**. An optional Tactico-hosted control plane is **planned (M5)** and has the same restriction. |
 | Gateway or injector | **Implemented.** `Gateway::inject` unwraps the workspace KEK, opens the payload, and injects. Proxy is the delivery mode on the public listener. | A customer-run injector, or an attested enclave for hosted proxy injection. Both are **planned (M3)**. There is no production mode in which the control-plane operator decrypts. |
-| Storage | **Implemented.** `MemoryStore` in `crates/gateway/src/store.rs`. Rows die with the process. | A durable store with the logical schema in [ENCRYPTION.md](ENCRYPTION.md) section 7, including `wrap_mode` and `e2e_encapsulation`. **Planned (M1)**. |
+| Storage | **Implemented.** `SqlStore` in `crates/gateway/src/sql_store.rs` speaks SQLite for local runs and Postgres for production, behind the same `Store` trait. `MemoryStore` remains for unit tests. `wrap_mode` and `e2e_encapsulation` are columns. Writers reject `e2e`. | The same schema, with production writes sealed before they reach the control plane. **Planned (M3)**. |
 | KMS or HSM | **Implemented** as a dev stand-in only. `DevFileRootKeys` writes raw 32-byte tenant root keys to `.credentials-dev-keys.json` (override `CREDENTIALS_DEV_KEYS`), mode `0600` on Unix. `MemoryRootKeys` holds the same kind of key in process memory. `CREDENTIALS_ENV=production` refuses both, and `Gateway::new` refuses to start. | Non-exportable token-signing and audit-signing keys in a cloud KMS or, later, a PKCS#11 HSM. **Planned (M4)**. The production control plane has no `Decrypt` permission on keys that wrap secret data keys. **Planned (M3)**. |
-| Audit log | **Implemented.** A per-workspace hash chain and a per-agent chain. The allow event is appended before decrypt, and a failed append skips decrypt. | Signed checkpoints and an external anchor the database role cannot rewrite. **Planned (M1)**. What remains enforceable once the customer holds the key is described in section 6. |
+| Audit log | **Implemented.** A per-workspace hash chain and a per-agent chain. The allow event is appended before decrypt, and a failed append skips decrypt. Tips are signed and copied to an `AuditAnchor`. The dev anchor is a local file and is refused when `CREDENTIALS_ENV=production`. A lagged anchor makes inject return 503 before decrypt. | A retention-locked object store for a hosted deployment. **Planned (M5)**. What remains enforceable once the customer holds the key is described in section 6. |
 
 The dev path is a single process that both stores the rows and holds the root key. That shape is for loopback development. Self-hosted production, **planned (M3)**, means the customer runs the control plane and still cannot open secrets from that process. The workload owner runs the injector, with the workspace key, in a separate trust domain from the people who administer the database.
 
@@ -156,7 +156,7 @@ sequenceDiagram
   end
 ```
 
-Order on the allowed path: agent token, DPoP, scope check, audit append, decrypt, inject. The token check and the unwrap are separate functions. They run in the same process, and the process sees plaintext between decrypt and the upstream call. A failed DPoP proof, a replayed DPoP `jti`, or a disabled agent returns 401 before any audit append, and those paths skip decrypt too. Scope, host, revocation, and policy denials append `secret.access.denied` first. `cargo run` uses `UnconfiguredUpstream`, so proxy inject returns an upstream error until a test double or a later client is wired. Tests use `RecordingUpstream`.
+Order on the allowed path: agent token, DPoP, scope check, audit append, decrypt, inject. The token check and the unwrap are separate functions. They run in the same process, and the process sees plaintext between decrypt and the upstream call. A failed DPoP proof, a replayed DPoP `jti`, or a disabled agent returns 401 before any audit append, and those paths skip decrypt too. Scope, host, revocation, and policy denials append `secret.access.denied` first. `cargo run` uses an HTTPS upstream client. It overwrites the policy header, does not follow redirects, and does not copy that header back. Tests use `RecordingUpstream`.
 
 A denied request does not call `RootKeyProvider::decrypt`. That is covered by tests. On a GCM or KMS failure after the allow event, the gateway appends `secret.access.failed` and returns a generic error. The client-facing decrypt error does not say whether the tag, the nonce, or the associated data was wrong.
 
@@ -358,7 +358,7 @@ hash       = SHA-256(prev_hash || body)
 agent_hash = SHA-256(body)    when the event has an agent
 ```
 
-`verify_chain` recomputes both and is run before an audit read is returned. There is no KMS signature over the tip, no `audit_checkpoints` row, and no external anchor in this build. A hash chain stored next to the rows it protects does not stop an attacker who can rewrite both. The anchor is what closes that, and it is **planned (M1)**.
+`verify_chain` recomputes both and is run before an audit read is returned. The dev process signs the tip with its Ed25519 signer and appends the signature to a local anchor file. A production signer would use KMS Sign, which is **planned (M4)**. A hosted retention-locked bucket is **planned (M5)**.
 
 ```mermaid
 flowchart TD
@@ -410,14 +410,14 @@ X-Wing stays secure if either X25519 or ML-KEM-768 falls. The crate is RustCrypt
 
 The points below are easy to miss if a reader treats [ENCRYPTION.md](ENCRYPTION.md) or the README as a description of the running binary. This document is the map. The spec remains the normative text for the envelope that is implemented.
 
-- [ENCRYPTION.md](ENCRYPTION.md) still opens with "No code in this repository implements it yet" and still names Go as the reference language. The envelope, the dev root provider, tokens, DPoP, inject, and the hash chain are implemented in Rust. Updating that status line is **planned (M1)**.
+- [ENCRYPTION.md](ENCRYPTION.md) names Rust as the implementation language of record. The Go TLS notes are guidance for the hosted and self-hosted TLS stack, not a second codebase.
 - [ENCRYPTION.md](ENCRYPTION.md) section 10, and the README bullet about keeping secrets in Infisical, 1Password, or Doppler, still describe a live fetch at inject time. The roadmap's direction is one-shot import into native ciphertext, **planned (M6)**. No import code and no live backend client exist in this tree. This document follows the roadmap.
 - The README still names Momentum as the first client. The public API is client-agnostic, and the in-tree client is `credentials-client`. Naming no house client in the integrator docs is **planned (M2)**.
 - `SealedSecret` has no `wrap_mode` and no `e2e_encapsulation`. Writers cannot yet store an end-to-end row, and the running store has nowhere to put one.
 - DPoP `htu` is taken from a request header, as section 5 describes. Per-token `jti` revocation is specified and not built. A disabled agent, a failed DPoP proof, or a replayed DPoP `jti` returns 401 without an audit row. `secret.access.delivered` and `secret.access.failed` ignore an append error. The allow event does not.
 - Workspace delete does not revoke sessions, delete secret rows, or set `shredded`. KEK rotation runs inside the request. There is no rewrap-job table.
 - The public listener refuses env and header. Inside `Gateway::inject`, header delivery still forwards through `Upstream`, and the env branch returns the raw plaintext bytes rather than the `{ env_name, value }` object in the spec. The local channel itself is not built. **Planned (M2)**.
-- There is no cloud KMS, no HSM, no TLS, no audit anchor, no durable database, no WebAuthn, and no device or recovery-kit enrollment.
+- There is no cloud KMS, no HSM, no public TLS listener, no WebAuthn, and no device or recovery-kit enrollment. Durable storage and a dev audit anchor are in the tree. The hosted anchor is not.
 
 ## 10. Related documents
 
