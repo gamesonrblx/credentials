@@ -20,6 +20,7 @@ Credentials is a standalone API and gateway from day one. It is not embedded in 
 
 ## Design docs
 
+- [Architecture](docs/ARCHITECTURE.md). How the pieces fit together today, and the target zero-knowledge design: key hierarchy, injection, account-bound recovery, tokens, and the audit log.
 - [Encryption and key management](docs/ENCRYPTION.md). Envelope encryption, key rotation and crypto-shredding, post-quantum key transport, agent tokens, injection, and the audit log. This is the implementation spec for that part of the system.
 
 ## Status
