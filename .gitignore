@@ -2,6 +2,11 @@
 **/*.rs.bk
 .credentials-dev-keys.json
 .credentials-dev-keys.tmp
+.credentials-dev-signer.json
+.credentials-dev-signer.tmp
+.credentials-dev.sqlite
+.credentials-dev.sqlite-wal
+.credentials-dev.sqlite-shm
 *.pem
 .env
 .env.*

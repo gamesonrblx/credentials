@@ -5,10 +5,12 @@
 //! workspace chain commits to the per-agent links. The encoding is the one in
 //! the encryption spec.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum AuditValue {
     String(String),
     Uuid(Uuid),
@@ -38,6 +40,36 @@ pub struct AuditRecord {
     pub hash: [u8; 32],
     pub agent_prev_hash: [u8; 32],
     pub agent_hash: Option<[u8; 32]>,
+}
+
+/// Hash one event. Callers allocate `seq` and the previous tips. The store
+/// persists the returned record and does not recompute it later.
+pub fn commit_event(
+    draft: AuditDraft,
+    seq: u64,
+    prev_hash: [u8; 32],
+    agent_prev_hash: [u8; 32],
+    agent_seq: u64,
+) -> AuditRecord {
+    let mut record = AuditRecord {
+        workspace_id: draft.workspace_id,
+        seq,
+        agent_id: draft.agent_id,
+        agent_seq,
+        event_type: draft.event_type,
+        occurred_at_nanos: draft.occurred_at_nanos,
+        fields: draft.fields,
+        prev_hash,
+        hash: [0u8; 32],
+        agent_prev_hash,
+        agent_hash: None,
+    };
+    let body = canonical_body(&record);
+    record.hash = workspace_hash(&prev_hash, &body);
+    if record.agent_id.is_some() {
+        record.agent_hash = Some(agent_hash(&body));
+    }
+    record
 }
 
 pub fn canonical_body(record: &AuditRecord) -> Vec<u8> {

@@ -6,7 +6,9 @@
 //! It refuses to start when `CREDENTIALS_ENV=production`.
 //!
 //! Not implemented yet: a cloud KMS, TLS termination with `X25519MLKEM768`,
-//! the end-to-end mode, external secret backends, and a durable database.
+//! the end-to-end mode, and external secret backends. SQLite and Postgres
+//! implement [`Store`]. `wrap_mode = e2e` is stored as a column and rejected
+//! on write until that mode exists.
 
 #![forbid(unsafe_code)]
 
@@ -19,6 +21,7 @@ mod names;
 mod policy;
 mod redact;
 mod service;
+mod sql_store;
 mod store;
 mod token;
 mod upstream;
@@ -32,7 +35,9 @@ pub use service::{
     generate_dpop, Clock, CreatedSession, Gateway, InjectRequest, InjectResponse, ManualClock, Now,
     ISSUER,
 };
-pub use store::MemoryStore;
+pub use sql_store::SqlStore;
+pub use store::{MemoryStore, Store, WrapMode};
+pub use token::DevSigner;
 pub use upstream::{RecordingUpstream, UnconfiguredUpstream, Upstream};
 
 use std::net::SocketAddr;

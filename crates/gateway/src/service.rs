@@ -23,7 +23,9 @@ use crate::policy::{
     delivery_allowed, format_header, host_allowed, https_host, scope_allowed_on_agent,
     scope_allows, validate_policy, Delivery, DeliveryPolicy,
 };
-use crate::store::{AgentRow, KekRow, SecretRow, SessionRow, Store, VersionRow, WorkspaceRow};
+use crate::store::{
+    AgentRow, KekRow, SecretRow, SessionRow, Store, VersionRow, WorkspaceRow, WrapMode,
+};
 use crate::token::{AgentClaims, DevSigner, DEFAULT_TTL_SECS, MAX_TTL_SECS};
 use crate::upstream::{Outbound, Upstream};
 use crate::ApiError;
@@ -149,6 +151,16 @@ impl Gateway {
         upstream: Arc<dyn Upstream>,
         clock: Arc<dyn Now>,
     ) -> Result<Self, ApiError> {
+        Self::with_signer(store, kms, upstream, clock, DevSigner::generate("dev-1")?)
+    }
+
+    pub fn with_signer(
+        store: Arc<dyn Store>,
+        kms: Arc<dyn RootKeyProvider>,
+        upstream: Arc<dyn Upstream>,
+        clock: Arc<dyn Now>,
+        signer: DevSigner,
+    ) -> Result<Self, ApiError> {
         if !DevPolicy::from_env().allow_dev {
             return Err(ApiError::KmsUnavailable);
         }
@@ -156,7 +168,7 @@ impl Gateway {
             store,
             kms,
             upstream,
-            signer: DevSigner::generate("dev-1")?,
+            signer,
             clock,
             kek_cache: Mutex::new(HashMap::new()),
             dpop_seen: Mutex::new(HashMap::new()),
@@ -164,7 +176,7 @@ impl Gateway {
         })
     }
 
-    pub fn create_workspace(&self) -> Result<CreatedWorkspace, ApiError> {
+    pub async fn create_workspace(&self) -> Result<CreatedWorkspace, ApiError> {
         let id = Uuid::now_v7();
         let key_ref = self.kms.create_tenant_root(id).map_err(map_crypto)?;
         let kek_id = Uuid::now_v7();
@@ -180,23 +192,25 @@ impl Gateway {
             .map_err(map_crypto)?;
         let credential = ZeroizingBuf::new(random_32()?);
         let hash = sha256(credential.as_slice());
-        self.store.insert_workspace(
-            WorkspaceRow {
-                id,
-                status: "active".to_owned(),
-                kms_key_ref: key_ref.clone(),
-                credential_hash: hash,
-                audit_seq: 0,
-            },
-            KekRow {
-                id: kek_id,
-                workspace_id: id,
-                version: 1,
-                status: "active".to_owned(),
-                wrapped_kek: wrapped,
-                kms_key_ref: key_ref,
-            },
-        )?;
+        self.store
+            .insert_workspace(
+                WorkspaceRow {
+                    id,
+                    status: "active".to_owned(),
+                    kms_key_ref: key_ref.clone(),
+                    credential_hash: hash,
+                    audit_seq: 0,
+                },
+                KekRow {
+                    id: kek_id,
+                    workspace_id: id,
+                    version: 1,
+                    status: "active".to_owned(),
+                    wrapped_kek: wrapped,
+                    kms_key_ref: key_ref,
+                },
+            )
+            .await?;
         let encoded = crate::b64::b64url_encode(credential.as_slice());
         Ok(CreatedWorkspace {
             id,
@@ -204,14 +218,14 @@ impl Gateway {
         })
     }
 
-    pub fn create_secret(
+    pub async fn create_secret(
         &self,
         credential: &str,
         name: &str,
         value: &[u8],
         policy: DeliveryPolicy,
     ) -> Result<CreatedVersion, ApiError> {
-        let workspace = self.authenticate_workspace(credential)?;
+        let workspace = self.authenticate_workspace(credential).await?;
         self.ensure_active(&workspace)?;
         if !valid_secret_name(name) {
             return Err(ApiError::BadRequest);
@@ -220,7 +234,7 @@ impl Gateway {
         if value.len() > DEFAULT_MAX_SECRET_BYTES {
             return Err(ApiError::PayloadTooLarge);
         }
-        let kek_row = self.store.active_kek(workspace.id)?;
+        let kek_row = self.store.active_kek(workspace.id).await?;
         let kek = self.unwrap_kek(&workspace, &kek_row)?;
         let secret_id = Uuid::now_v7();
         let version_id = Uuid::now_v7();
@@ -238,33 +252,37 @@ impl Gateway {
             DEFAULT_MAX_SECRET_BYTES,
         )
         .map_err(map_crypto)?;
-        self.store.insert_secret(
-            SecretRow {
-                id: secret_id,
-                workspace_id: workspace.id,
-                name: name.to_owned(),
-                status: "active".to_owned(),
-                policy,
-            },
-            VersionRow {
-                id: version_id,
-                secret_id,
-                workspace_id: workspace.id,
-                version: 1,
-                sealed,
-                kek_id: kek_row.id,
-            },
-            self.audit(
-                workspace.id,
-                None,
-                "secret.write",
-                vec![
-                    ("secret_id".into(), AuditValue::Uuid(secret_id)),
-                    ("version_id".into(), AuditValue::Uuid(version_id)),
-                    ("secret_name".into(), AuditValue::String(name.to_owned())),
-                ],
-            ),
-        )?;
+        self.store
+            .insert_secret(
+                SecretRow {
+                    id: secret_id,
+                    workspace_id: workspace.id,
+                    name: name.to_owned(),
+                    status: "active".to_owned(),
+                    policy,
+                },
+                VersionRow {
+                    id: version_id,
+                    secret_id,
+                    workspace_id: workspace.id,
+                    version: 1,
+                    sealed,
+                    kek_id: kek_row.id,
+                    wrap_mode: WrapMode::Gateway,
+                    e2e_encapsulation: None,
+                },
+                self.audit(
+                    workspace.id,
+                    None,
+                    "secret.write",
+                    vec![
+                        ("secret_id".into(), AuditValue::Uuid(secret_id)),
+                        ("version_id".into(), AuditValue::Uuid(version_id)),
+                        ("secret_name".into(), AuditValue::String(name.to_owned())),
+                    ],
+                ),
+            )
+            .await?;
         Ok(CreatedVersion {
             secret_id,
             version_id,
@@ -272,23 +290,29 @@ impl Gateway {
         })
     }
 
-    pub fn create_agent(&self, credential: &str, display_name: &str) -> Result<Uuid, ApiError> {
-        let workspace = self.authenticate_workspace(credential)?;
+    pub async fn create_agent(
+        &self,
+        credential: &str,
+        display_name: &str,
+    ) -> Result<Uuid, ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
         self.ensure_active(&workspace)?;
         if display_name.is_empty() || display_name.len() > 128 {
             return Err(ApiError::BadRequest);
         }
         let id = Uuid::now_v7();
-        self.store.insert_agent(AgentRow {
-            id,
-            workspace_id: workspace.id,
-            display_name: display_name.to_owned(),
-            status: "active".to_owned(),
-        })?;
+        self.store
+            .insert_agent(AgentRow {
+                id,
+                workspace_id: workspace.id,
+                display_name: display_name.to_owned(),
+                status: "active".to_owned(),
+            })
+            .await?;
         Ok(id)
     }
 
-    pub fn create_session(
+    pub async fn create_session(
         &self,
         credential: &str,
         agent_id: Uuid,
@@ -296,9 +320,9 @@ impl Gateway {
         ttl_seconds: Option<u64>,
         dpop_public_b64: &str,
     ) -> Result<CreatedSession, ApiError> {
-        let workspace = self.authenticate_workspace(credential)?;
+        let workspace = self.authenticate_workspace(credential).await?;
         self.ensure_active(&workspace)?;
-        let agent = self.store.agent(agent_id)?;
+        let agent = self.store.agent(agent_id).await?;
         if agent.workspace_id != workspace.id || agent.status != "active" {
             return Err(ApiError::NotFound);
         }
@@ -313,15 +337,17 @@ impl Gateway {
         let now = self.clock.unix_secs();
         let session_id = Uuid::now_v7();
         let exp = now + ttl;
-        self.store.insert_session(SessionRow {
-            id: session_id,
-            workspace_id: workspace.id,
-            agent_id,
-            dpop_jkt: jkt.clone(),
-            scopes: scopes.clone(),
-            expires_at: exp,
-            revoked_at: None,
-        })?;
+        self.store
+            .insert_session(SessionRow {
+                id: session_id,
+                workspace_id: workspace.id,
+                agent_id,
+                dpop_jkt: jkt.clone(),
+                scopes: scopes.clone(),
+                expires_at: exp,
+                revoked_at: None,
+            })
+            .await?;
         let claims = AgentClaims {
             exp,
             iat: now,
@@ -333,15 +359,17 @@ impl Gateway {
             jkt,
         };
         let token = self.signer.sign(ISSUER, &claims)?;
-        self.store.append_audit(self.audit(
-            workspace.id,
-            Some(agent_id),
-            "token.issued",
-            vec![
-                ("session_id".into(), AuditValue::Uuid(session_id)),
-                ("jti".into(), AuditValue::Uuid(claims.jti)),
-            ],
-        ))?;
+        self.store
+            .append_audit(self.audit(
+                workspace.id,
+                Some(agent_id),
+                "token.issued",
+                vec![
+                    ("session_id".into(), AuditValue::Uuid(session_id)),
+                    ("jti".into(), AuditValue::Uuid(claims.jti)),
+                ],
+            ))
+            .await?;
         Ok(CreatedSession {
             session_id,
             token,
@@ -349,20 +377,22 @@ impl Gateway {
         })
     }
 
-    pub fn revoke_session(&self, credential: &str, session_id: Uuid) -> Result<(), ApiError> {
-        let workspace = self.authenticate_workspace(credential)?;
-        let session = self.store.session(session_id)?;
+    pub async fn revoke_session(&self, credential: &str, session_id: Uuid) -> Result<(), ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        let session = self.store.session(session_id).await?;
         if session.workspace_id != workspace.id {
             return Err(ApiError::NotFound);
         }
         let now = self.clock.unix_secs();
-        self.store.revoke_session(session_id, now)?;
-        self.store.append_audit(self.audit(
-            workspace.id,
-            Some(session.agent_id),
-            "token.revoked",
-            vec![("session_id".into(), AuditValue::Uuid(session_id))],
-        ))?;
+        self.store.revoke_session(session_id, now).await?;
+        self.store
+            .append_audit(self.audit(
+                workspace.id,
+                Some(session.agent_id),
+                "token.revoked",
+                vec![("session_id".into(), AuditValue::Uuid(session_id))],
+            ))
+            .await?;
         Ok(())
     }
 
@@ -370,7 +400,7 @@ impl Gateway {
         let claims = self
             .signer
             .verify(&request.token, ISSUER, self.clock.unix_secs())?;
-        let workspace = self.store.workspace(claims.workspace_id)?;
+        let workspace = self.store.workspace(claims.workspace_id).await?;
         if workspace.status != "active" {
             self.audit_or_fail(
                 workspace.id,
@@ -380,10 +410,11 @@ impl Gateway {
                     "reason".into(),
                     AuditValue::String("workspace_inactive".into()),
                 )],
-            )?;
+            )
+            .await?;
             return Err(ApiError::WorkspaceDeleting);
         }
-        let session = self.store.session(claims.session_id)?;
+        let session = self.store.session(claims.session_id).await?;
         if session.revoked_at.is_some()
             || session.workspace_id != claims.workspace_id
             || session.agent_id != claims.agent_id
@@ -395,10 +426,11 @@ impl Gateway {
                 Some(claims.agent_id),
                 "secret.access.denied",
                 vec![("reason".into(), AuditValue::String("revoked".into()))],
-            )?;
+            )
+            .await?;
             return Err(ApiError::Unauthenticated);
         }
-        let agent = self.store.agent(claims.agent_id)?;
+        let agent = self.store.agent(claims.agent_id).await?;
         if agent.status != "active" {
             return Err(ApiError::Unauthenticated);
         }
@@ -414,7 +446,11 @@ impl Gateway {
         }
         self.remember_dpop(&proof_jti(&request.dpop)?, self.clock.unix_secs())?;
 
-        let secret = match self.store.secret_by_name(workspace.id, &request.secret) {
+        let secret = match self
+            .store
+            .secret_by_name(workspace.id, &request.secret)
+            .await
+        {
             Ok(secret) => secret,
             Err(ApiError::NotFound) => {
                 self.audit_or_fail(
@@ -428,7 +464,8 @@ impl Gateway {
                             AuditValue::String(request.secret.clone()),
                         ),
                     ],
-                )?;
+                )
+                .await?;
                 return Err(ApiError::NotFound);
             }
             Err(err) => return Err(err),
@@ -442,7 +479,8 @@ impl Gateway {
                 Some(claims.agent_id),
                 "secret.access.denied",
                 vec![("reason".into(), AuditValue::String("scope".into()))],
-            )?;
+            )
+            .await?;
             return Err(ApiError::Forbidden);
         }
         if matches!(request.delivery, Delivery::Env | Delivery::Header) && !request.local_channel {
@@ -451,7 +489,8 @@ impl Gateway {
                 Some(claims.agent_id),
                 "secret.access.denied",
                 vec![("reason".into(), AuditValue::String("local_channel".into()))],
-            )?;
+            )
+            .await?;
             return Err(ApiError::Forbidden);
         }
         let host = if matches!(request.delivery, Delivery::Proxy | Delivery::Header) {
@@ -462,7 +501,8 @@ impl Gateway {
                     Some(claims.agent_id),
                     "secret.access.denied",
                     vec![("reason".into(), AuditValue::String("host".into()))],
-                )?;
+                )
+                .await?;
                 return Err(ApiError::Forbidden);
             }
             Some(host)
@@ -475,19 +515,26 @@ impl Gateway {
             Some(claims.agent_id),
             "secret.access.allowed",
             access_fields(&secret, None, request.delivery, host.as_deref()),
-        )?;
+        )
+        .await?;
 
-        let version = self.store.latest_version(secret.id)?;
-        let kek_row = self.store.kek(version.kek_id)?;
+        let version = self.store.latest_version(secret.id).await?;
+        if version.wrap_mode != WrapMode::Gateway || version.e2e_encapsulation.is_some() {
+            return Err(ApiError::DecryptFailed);
+        }
+        let kek_row = self.store.kek(version.kek_id).await?;
         let kek = match self.unwrap_kek(&workspace, &kek_row) {
             Ok(kek) => kek,
             Err(err) => {
-                let _ = self.store.append_audit(self.audit(
-                    workspace.id,
-                    Some(claims.agent_id),
-                    "secret.access.failed",
-                    vec![("reason".into(), AuditValue::String("kms".into()))],
-                ));
+                let _ = self
+                    .store
+                    .append_audit(self.audit(
+                        workspace.id,
+                        Some(claims.agent_id),
+                        "secret.access.failed",
+                        vec![("reason".into(), AuditValue::String("kms".into()))],
+                    ))
+                    .await;
                 return Err(err);
             }
         };
@@ -510,12 +557,15 @@ impl Gateway {
             Ok(plaintext) => plaintext,
             Err(_) => {
                 self.metrics_integrity.fetch_add(1, Ordering::Relaxed);
-                let _ = self.store.append_audit(self.audit(
-                    workspace.id,
-                    Some(claims.agent_id),
-                    "secret.access.failed",
-                    vec![("reason".into(), AuditValue::String("integrity".into()))],
-                ));
+                let _ = self
+                    .store
+                    .append_audit(self.audit(
+                        workspace.id,
+                        Some(claims.agent_id),
+                        "secret.access.failed",
+                        vec![("reason".into(), AuditValue::String("integrity".into()))],
+                    ))
+                    .await;
                 return Err(ApiError::DecryptFailed);
             }
         };
@@ -550,32 +600,38 @@ impl Gateway {
         let response = match response {
             Ok(response) => response,
             Err(err) => {
-                let _ = self.store.append_audit(self.audit(
-                    workspace.id,
-                    Some(claims.agent_id),
-                    "secret.access.failed",
-                    vec![("reason".into(), AuditValue::String("upstream".into()))],
-                ));
+                let _ = self
+                    .store
+                    .append_audit(self.audit(
+                        workspace.id,
+                        Some(claims.agent_id),
+                        "secret.access.failed",
+                        vec![("reason".into(), AuditValue::String("upstream".into()))],
+                    ))
+                    .await;
                 return Err(err);
             }
         };
-        let _ = self.store.append_audit(self.audit(
-            workspace.id,
-            Some(claims.agent_id),
-            "secret.access.delivered",
-            access_fields(&secret, Some(version.id), request.delivery, host.as_deref()),
-        ));
+        let _ = self
+            .store
+            .append_audit(self.audit(
+                workspace.id,
+                Some(claims.agent_id),
+                "secret.access.delivered",
+                access_fields(&secret, Some(version.id), request.delivery, host.as_deref()),
+            ))
+            .await;
         Ok(InjectResponse {
             upstream_status: response.status,
             body: response.body,
         })
     }
 
-    pub fn rotate_kek(&self, credential: &str) -> Result<u32, ApiError> {
-        let workspace = self.authenticate_workspace(credential)?;
+    pub async fn rotate_kek(&self, credential: &str) -> Result<u32, ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
         self.ensure_active(&workspace)?;
-        let old = self.store.active_kek(workspace.id)?;
-        let new_version = self.store.next_kek_version(workspace.id)?;
+        let old = self.store.active_kek(workspace.id).await?;
+        let new_version = self.store.next_kek_version(workspace.id).await?;
         let new_id = Uuid::now_v7();
         let raw = ZeroizingBuf::new(random_32()?);
         let context = KekContext {
@@ -587,65 +643,50 @@ impl Gateway {
             .kms
             .encrypt(&workspace.kms_key_ref, raw.as_slice(), &context)
             .map_err(map_crypto)?;
-        self.store.insert_kek(KekRow {
-            id: new_id,
-            workspace_id: workspace.id,
-            version: new_version,
-            status: "active".to_owned(),
-            wrapped_kek: wrapped,
-            kms_key_ref: workspace.kms_key_ref.clone(),
-        })?;
-        self.store.set_kek_status(old.id, "decrypt_only")?;
-        let old_key = self.unwrap_kek(&workspace, &old)?;
-        let new_row = self.store.kek(new_id)?;
-        let new_key = self.unwrap_kek(&workspace, &new_row)?;
-        for version in self.store.versions_for_kek(old.id)? {
-            let ids = VersionIds {
-                workspace_id: version.workspace_id,
-                secret_id: version.secret_id,
-                version_id: version.id,
-            };
-            let sealed = rewrap_dek(
-                UnwrappedKek {
-                    key: &old_key,
-                    id: old.id,
-                    version: old.version,
-                },
-                UnwrappedKek {
-                    key: &new_key,
+        self.store
+            .swap_active_kek(
+                old.id,
+                KekRow {
                     id: new_id,
+                    workspace_id: workspace.id,
                     version: new_version,
+                    status: "active".to_owned(),
+                    wrapped_kek: wrapped,
+                    kms_key_ref: workspace.kms_key_ref.clone(),
                 },
-                ids,
-                &version.sealed,
             )
-            .map_err(|_| ApiError::DecryptFailed)?;
-            let payload = version.sealed.payload_ciphertext.clone();
-            self.store.update_wrap(version.id, sealed, new_id)?;
-            let updated = self.store.latest_version(version.secret_id)?;
-            if updated.id == version.id && updated.sealed.payload_ciphertext != payload {
-                return Err(ApiError::DecryptFailed);
-            }
+            .await?;
+        let wrapped_rows = self
+            .rewrap_outstanding_keks(&workspace, old.id, new_id, new_version)
+            .await?;
+        if wrapped_rows > 0 && !self.store.versions_for_kek(old.id).await?.is_empty() {
+            return Err(ApiError::DecryptFailed);
         }
-        self.store.set_kek_status(old.id, "retired")?;
-        self.store.append_audit(self.audit(
-            workspace.id,
-            None,
-            "kek.rotated",
-            vec![(
-                "kek_version".into(),
-                AuditValue::U64(u64::from(new_version)),
-            )],
-        ))?;
+        if self.store.versions_for_kek(old.id).await?.is_empty() {
+            self.store.set_kek_status(old.id, "retired").await?;
+        }
+        self.store
+            .append_audit(self.audit(
+                workspace.id,
+                None,
+                "kek.rotated",
+                vec![(
+                    "kek_version".into(),
+                    AuditValue::U64(u64::from(new_version)),
+                )],
+            ))
+            .await?;
         Ok(new_version)
     }
 
-    pub fn delete_workspace(&self, credential: &str, confirm: Uuid) -> Result<(), ApiError> {
-        let workspace = self.authenticate_workspace(credential)?;
+    pub async fn delete_workspace(&self, credential: &str, confirm: Uuid) -> Result<(), ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
         if confirm != workspace.id {
             return Err(ApiError::BadRequest);
         }
-        self.store.set_workspace_status(workspace.id, "deleting")?;
+        self.store
+            .set_workspace_status(workspace.id, "deleting")
+            .await?;
         self.kms
             .schedule_destruction(
                 &workspace.kms_key_ref,
@@ -656,38 +697,121 @@ impl Gateway {
             .lock()
             .expect("cache lock")
             .retain(|_, entry| entry.workspace_id != workspace.id);
-        self.store.append_audit(self.audit(
-            workspace.id,
-            None,
-            "tenant.delete.scheduled",
-            Vec::new(),
-        ))?;
+        self.store
+            .append_audit(self.audit(workspace.id, None, "tenant.delete.scheduled", Vec::new()))
+            .await?;
         Ok(())
     }
 
-    pub fn audit_log(
+    pub async fn audit_log(
         &self,
         credential: &str,
         agent_id: Option<Uuid>,
     ) -> Result<Vec<AuditRecord>, ApiError> {
-        let workspace = self.authenticate_workspace(credential)?;
+        let workspace = self.authenticate_workspace(credential).await?;
         let events = match agent_id {
-            Some(agent) => self.store.audit_for_agent(workspace.id, agent)?,
-            None => self.store.audit_for_workspace(workspace.id)?,
+            Some(agent) => self.store.audit_for_agent(workspace.id, agent).await?,
+            None => self.store.audit_for_workspace(workspace.id).await?,
         };
-        if !verify_chain(&self.store.audit_for_workspace(workspace.id)?) {
+        if !verify_chain(&self.store.audit_for_workspace(workspace.id).await?) {
             return Err(ApiError::DecryptFailed);
         }
         Ok(events)
     }
 
-    fn authenticate_workspace(&self, credential: &str) -> Result<WorkspaceRow, ApiError> {
+    /// Retry a KEK rewrap. A second call wraps nothing and leaves payload bytes alone.
+    pub async fn rewrap_outstanding(&self, credential: &str) -> Result<u64, ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        self.ensure_active(&workspace)?;
+        let active = self.store.active_kek(workspace.id).await?;
+        let mut total = 0u64;
+        for kek in self.store.list_keks(workspace.id).await? {
+            if kek.id == active.id || kek.status == "destroyed" {
+                continue;
+            }
+            total += self.rewrap_between(&workspace, kek.id, active.id).await?;
+            if self.store.versions_for_kek(kek.id).await?.is_empty() && kek.status != "retired" {
+                self.store.set_kek_status(kek.id, "retired").await?;
+            }
+        }
+        Ok(total)
+    }
+
+    async fn rewrap_outstanding_keks(
+        &self,
+        workspace: &WorkspaceRow,
+        from_id: Uuid,
+        to_id: Uuid,
+        to_version: u32,
+    ) -> Result<u64, ApiError> {
+        let to = self.store.kek(to_id).await?;
+        if to.version != to_version {
+            return Err(ApiError::DecryptFailed);
+        }
+        self.rewrap_between(workspace, from_id, to_id).await
+    }
+
+    async fn rewrap_between(
+        &self,
+        workspace: &WorkspaceRow,
+        from_id: Uuid,
+        to_id: Uuid,
+    ) -> Result<u64, ApiError> {
+        let from = self.store.kek(from_id).await?;
+        let to = self.store.kek(to_id).await?;
+        let old_key = self.unwrap_kek(workspace, &from)?;
+        let new_key = self.unwrap_kek(workspace, &to)?;
+        let mut count = 0u64;
+        for version in self.store.versions_for_kek(from_id).await? {
+            if version.wrap_mode != WrapMode::Gateway || version.e2e_encapsulation.is_some() {
+                return Err(ApiError::DecryptFailed);
+            }
+            let payload = version.sealed.payload_ciphertext.clone();
+            let nonce = version.sealed.payload_nonce;
+            let sealed = rewrap_dek(
+                UnwrappedKek {
+                    key: &old_key,
+                    id: from.id,
+                    version: from.version,
+                },
+                UnwrappedKek {
+                    key: &new_key,
+                    id: to.id,
+                    version: to.version,
+                },
+                VersionIds {
+                    workspace_id: version.workspace_id,
+                    secret_id: version.secret_id,
+                    version_id: version.id,
+                },
+                &version.sealed,
+            )
+            .map_err(|_| ApiError::DecryptFailed)?;
+            if sealed.payload_ciphertext != payload || sealed.payload_nonce != nonce {
+                return Err(ApiError::DecryptFailed);
+            }
+            if self
+                .store
+                .update_wrap(version.id, from_id, sealed, to_id)
+                .await?
+            {
+                count += 1;
+            }
+            let updated = self.store.latest_version(version.secret_id).await?;
+            if updated.id == version.id && updated.sealed.payload_ciphertext != payload {
+                return Err(ApiError::DecryptFailed);
+            }
+        }
+        Ok(count)
+    }
+
+    async fn authenticate_workspace(&self, credential: &str) -> Result<WorkspaceRow, ApiError> {
         let raw = crate::b64::b64url_decode(credential)?;
         if raw.len() != 32 {
             return Err(ApiError::Unauthenticated);
         }
         let hash = sha256(&raw);
-        self.store.workspace_by_hash(&hash)
+        self.store.workspace_by_hash(&hash).await
     }
 
     fn ensure_active(&self, workspace: &WorkspaceRow) -> Result<(), ApiError> {
@@ -749,7 +873,7 @@ impl Gateway {
         }
     }
 
-    fn audit_or_fail(
+    async fn audit_or_fail(
         &self,
         workspace_id: Uuid,
         agent_id: Option<Uuid>,
@@ -758,6 +882,7 @@ impl Gateway {
     ) -> Result<(), ApiError> {
         self.store
             .append_audit(self.audit(workspace_id, agent_id, event_type, fields))
+            .await
             .map(|_| ())
     }
 

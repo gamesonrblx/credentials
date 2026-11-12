@@ -1,8 +1,11 @@
 //! Dev gateway process.
 //!
 //! Binds to `127.0.0.1:8080` unless `CREDENTIALS_LISTEN` is set. Root keys go
-//! in `CREDENTIALS_DEV_KEYS` (default `.credentials-dev-keys.json`). That file
-//! holds raw keys and is not a production KMS. The process exits if
+//! in `CREDENTIALS_DEV_KEYS` (default `.credentials-dev-keys.json`). The dev
+//! signer seed goes in `CREDENTIALS_DEV_SIGNER` (default
+//! `.credentials-dev-signer.json`). Rows go in `CREDENTIALS_DATABASE_URL`
+//! (default a SQLite file beside the process). Those files hold raw key
+//! material and are not a production KMS. The process exits if
 //! `CREDENTIALS_ENV=production`.
 //!
 //! Workspace creation on this listener is unauthenticated so a local process
@@ -12,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use credentials_crypto::{DevFileRootKeys, DevPolicy};
-use credentials_gateway::{serve, Clock, Gateway, MemoryStore, UnconfiguredUpstream};
+use credentials_gateway::{serve, Clock, DevSigner, Gateway, SqlStore, UnconfiguredUpstream};
 
 #[tokio::main]
 async fn main() {
@@ -40,11 +43,33 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let gateway = match Gateway::new(
-        Arc::new(MemoryStore::new()),
+    let signer_path = std::env::var("CREDENTIALS_DEV_SIGNER")
+        .unwrap_or_else(|_| ".credentials-dev-signer.json".into());
+    let signer = match DevSigner::load_or_create(std::path::Path::new(&signer_path), policy) {
+        Ok(signer) => signer,
+        Err(err) => {
+            eprintln!("dev signer: {err}");
+            std::process::exit(1);
+        }
+    };
+    let database_url = std::env::var("CREDENTIALS_DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite://.credentials-dev.sqlite".into());
+    let store = match SqlStore::connect(&database_url).await {
+        Ok(store) => {
+            tracing::info!(engine = store.engine_name(), "durable store ready");
+            Arc::new(store)
+        }
+        Err(err) => {
+            eprintln!("store: {err}");
+            std::process::exit(1);
+        }
+    };
+    let gateway = match Gateway::with_signer(
+        store,
         kms,
         Arc::new(UnconfiguredUpstream),
         Arc::new(Clock),
+        signer,
     ) {
         Ok(gateway) => Arc::new(gateway),
         Err(err) => {

@@ -8,9 +8,15 @@
 //!
 //! A token carries identity and scope. It does not carry a decryption key.
 
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::Path;
+
+use credentials_crypto::DevPolicy;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::b64::{b64url_decode, b64url_encode};
 use crate::ApiError;
@@ -60,12 +66,73 @@ struct Cnf {
 
 impl DevSigner {
     pub fn generate(kid: impl Into<String>) -> Result<Self, ApiError> {
-        let mut seed = [0u8; 32];
-        credentials_crypto::random_bytes(&mut seed).map_err(|_| ApiError::KmsUnavailable)?;
-        Ok(Self {
+        let mut seed = Zeroizing::new([0u8; 32]);
+        credentials_crypto::random_bytes(seed.as_mut_slice())
+            .map_err(|_| ApiError::KmsUnavailable)?;
+        Ok(Self::from_seed(kid, seed.as_slice()))
+    }
+
+    /// Dev signing seed on disk. Refused when `CREDENTIALS_ENV=production`.
+    /// The database must not hold this seed.
+    pub fn load_or_create(path: &Path, policy: DevPolicy) -> Result<Self, ApiError> {
+        if !policy.allow_dev {
+            return Err(ApiError::KmsUnavailable);
+        }
+        if path.exists() {
+            let bytes = fs::read(path).map_err(|_| ApiError::KmsUnavailable)?;
+            let file: SignerFile =
+                serde_json::from_slice(&bytes).map_err(|_| ApiError::KmsUnavailable)?;
+            let seed =
+                Zeroizing::new(hex_decode(&file.seed_hex).map_err(|_| ApiError::KmsUnavailable)?);
+            if seed.len() != 32 {
+                return Err(ApiError::KmsUnavailable);
+            }
+            return Ok(Self::from_seed(file.kid, seed.as_slice()));
+        }
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|_| ApiError::KmsUnavailable)?;
+            }
+        }
+        let signer = Self::generate("dev-1")?;
+        let seed = signer.signing.to_bytes();
+        let file = SignerFile {
+            warning: "DEV ONLY. Not for production. This file contains a raw signing seed."
+                .to_owned(),
+            kid: signer.kid.clone(),
+            seed_hex: hex_encode(&seed),
+        };
+        let bytes = serde_json::to_vec_pretty(&file).map_err(|_| ApiError::KmsUnavailable)?;
+        let tmp = path.with_extension("tmp");
+        {
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut out = options.open(&tmp).map_err(|_| ApiError::KmsUnavailable)?;
+            out.write_all(&bytes)
+                .map_err(|_| ApiError::KmsUnavailable)?;
+            out.sync_all().map_err(|_| ApiError::KmsUnavailable)?;
+        }
+        fs::rename(&tmp, path).map_err(|_| ApiError::KmsUnavailable)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+        Ok(signer)
+    }
+
+    fn from_seed(kid: impl Into<String>, seed: &[u8]) -> Self {
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(&seed[..32]);
+        Self {
             kid: kid.into(),
-            signing: SigningKey::from_bytes(&seed),
-        })
+            signing: SigningKey::from_bytes(&raw),
+        }
     }
 
     pub fn sign(&self, iss: &str, claims: &AgentClaims) -> Result<String, ApiError> {
@@ -169,6 +236,33 @@ fn split_jwt(token: &str) -> Result<(&str, &str, &str), ApiError> {
 
 fn json_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[derive(Serialize, Deserialize)]
+struct SignerFile {
+    warning: String,
+    kid: String,
+    seed_hex: String,
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>, ()> {
+    if !value.len().is_multiple_of(2) {
+        return Err(());
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&value[i..i + 2], 16).map_err(|_| ()))
+        .collect()
 }
 
 #[cfg(test)]

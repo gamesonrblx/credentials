@@ -10,6 +10,13 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+SQLite is the default durable engine for local runs and for the macOS and Windows CI jobs. The Ubuntu Postgres job sets `CREDENTIALS_TEST_POSTGRES` to a service container. To run that test locally:
+
+```bash
+CREDENTIALS_TEST_POSTGRES=postgres://credentials:credentials@localhost:5432/credentials?sslmode=disable \
+  cargo test -p credentials-gateway --test durable
+```
+
 `cargo deny check` runs in CI and checks dependency advisories and licenses.
 
 ## Pull requests

@@ -49,7 +49,7 @@ struct WorkspaceResponse {
 async fn create_workspace(
     State(state): State<AppState>,
 ) -> Result<Json<WorkspaceResponse>, ApiError> {
-    let created: CreatedWorkspace = state.gateway.create_workspace()?;
+    let created: CreatedWorkspace = state.gateway.create_workspace().await?;
     Ok(Json(WorkspaceResponse {
         id: created.id,
         credential: created.credential,
@@ -96,20 +96,23 @@ async fn create_secret(
 ) -> Result<Json<VersionResponse>, ApiError> {
     let credential = bearer(&headers)?;
     let value = b64std_decode(&body.value)?;
-    let created: CreatedVersion = state.gateway.create_secret(
-        credential,
-        &body.name,
-        &value,
-        DeliveryPolicy {
-            header_name: body.policy.header_name,
-            header_format: body.policy.header_format,
-            env_name: body.policy.env_name,
-            hosts: body.policy.hosts,
-            allow_proxy: body.policy.allow_proxy,
-            allow_header: body.policy.allow_header,
-            allow_env: body.policy.allow_env,
-        },
-    )?;
+    let created: CreatedVersion = state
+        .gateway
+        .create_secret(
+            credential,
+            &body.name,
+            &value,
+            DeliveryPolicy {
+                header_name: body.policy.header_name,
+                header_format: body.policy.header_format,
+                env_name: body.policy.env_name,
+                hosts: body.policy.hosts,
+                allow_proxy: body.policy.allow_proxy,
+                allow_header: body.policy.allow_header,
+                allow_env: body.policy.allow_env,
+            },
+        )
+        .await?;
     Ok(Json(VersionResponse {
         secret_id: created.secret_id,
         version_id: created.version_id,
@@ -134,7 +137,8 @@ async fn create_agent(
 ) -> Result<Json<AgentResponse>, ApiError> {
     let id = state
         .gateway
-        .create_agent(bearer(&headers)?, &body.display_name)?;
+        .create_agent(bearer(&headers)?, &body.display_name)
+        .await?;
     Ok(Json(AgentResponse { id }))
 }
 
@@ -158,13 +162,16 @@ async fn create_session(
     headers: HeaderMap,
     Json(body): Json<SessionBody>,
 ) -> Result<Json<SessionResponse>, ApiError> {
-    let created: CreatedSession = state.gateway.create_session(
-        bearer(&headers)?,
-        body.agent_id,
-        body.scopes,
-        body.ttl_seconds,
-        &body.dpop_public_b64,
-    )?;
+    let created: CreatedSession = state
+        .gateway
+        .create_session(
+            bearer(&headers)?,
+            body.agent_id,
+            body.scopes,
+            body.ttl_seconds,
+            &body.dpop_public_b64,
+        )
+        .await?;
     Ok(Json(SessionResponse {
         session_id: created.session_id,
         token: created.token,
@@ -177,7 +184,7 @@ async fn revoke_session(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    state.gateway.revoke_session(bearer(&headers)?, id)?;
+    state.gateway.revoke_session(bearer(&headers)?, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -272,7 +279,10 @@ async fn audit(
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> Result<Json<AuditResponse>, ApiError> {
-    let events = state.gateway.audit_log(bearer(&headers)?, query.agent_id)?;
+    let events = state
+        .gateway
+        .audit_log(bearer(&headers)?, query.agent_id)
+        .await?;
     Ok(Json(AuditResponse {
         events: events
             .into_iter()
@@ -290,7 +300,7 @@ async fn rotate_kek(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let version = state.gateway.rotate_kek(bearer(&headers)?)?;
+    let version = state.gateway.rotate_kek(bearer(&headers)?).await?;
     Ok(Json(serde_json::json!({ "kek_version": version })))
 }
 
@@ -299,7 +309,10 @@ async fn delete_workspace(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    state.gateway.delete_workspace(bearer(&headers)?, id)?;
+    state
+        .gateway
+        .delete_workspace(bearer(&headers)?, id)
+        .await?;
     Ok(StatusCode::ACCEPTED)
 }
 

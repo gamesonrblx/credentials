@@ -26,6 +26,8 @@ pub enum ApiError {
     KmsUnavailable,
     #[error("the audit log could not be appended")]
     AuditFailed,
+    #[error("the store is unavailable")]
+    StoreUnavailable,
     #[error("the workspace is being deleted")]
     WorkspaceDeleting,
     #[error("the request is invalid")]
@@ -44,6 +46,7 @@ impl ApiError {
             Self::UpstreamFailed => "upstream_failed",
             Self::KmsUnavailable => "kms_unavailable",
             Self::AuditFailed => "audit_failed",
+            Self::StoreUnavailable => "store_unavailable",
             Self::WorkspaceDeleting => "workspace_deleting",
             Self::BadRequest => "bad_request",
         }
@@ -59,7 +62,9 @@ impl ApiError {
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::DecryptFailed => StatusCode::INTERNAL_SERVER_ERROR,
             Self::UpstreamFailed => StatusCode::BAD_GATEWAY,
-            Self::KmsUnavailable | Self::AuditFailed => StatusCode::SERVICE_UNAVAILABLE,
+            Self::KmsUnavailable | Self::AuditFailed | Self::StoreUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::WorkspaceDeleting => StatusCode::CONFLICT,
         }
     }

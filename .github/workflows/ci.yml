@@ -46,6 +46,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
 
+  test-postgres:
+    name: test (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: credentials
+          POSTGRES_PASSWORD: credentials
+          POSTGRES_DB: credentials
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U credentials -d credentials"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p credentials-gateway --locked --test durable -- --test-threads=1
+        env:
+          CREDENTIALS_TEST_POSTGRES: postgres://credentials:credentials@localhost:5432/credentials?sslmode=disable
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
