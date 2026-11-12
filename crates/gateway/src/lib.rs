@@ -1,14 +1,12 @@
 //! Credentials gateway.
 //!
-//! This crate is the pre-alpha server: short-lived Ed25519 tokens, a scope
-//! check, envelope decryption, proxy injection, and a hash-chained audit log.
-//! The root-key provider is the dev implementation from `credentials-crypto`.
-//! It refuses to start when `CREDENTIALS_ENV=production`.
-//!
-//! Not implemented yet: a cloud KMS, TLS termination with `X25519MLKEM768`,
-//! the end-to-end mode, and external secret backends. SQLite and Postgres
-//! implement [`Store`]. `wrap_mode = e2e` is stored as a column and rejected
-//! on write until that mode exists.
+//! This crate is the pre-alpha server.
+//! It issues short Ed25519 tokens.
+//! It checks scope.
+//! The dev path opens `wrap_mode=gateway` rows.
+//! The production path does not open `wrap_mode=e2e` rows.
+//! SQLite and Postgres implement [`Store`].
+//! TLS 1.3 can negotiate group 4588.
 
 #![forbid(unsafe_code)]
 

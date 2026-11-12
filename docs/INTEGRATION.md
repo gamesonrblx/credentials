@@ -1,23 +1,25 @@
-# Integrating a runtime with Credentials
+# Integrate a runtime with Credentials
 
-Status: public pre-alpha. This gateway can read secret plaintext. Do not treat it as zero-knowledge against the operator. No customer, SOC 2, or certification claim.
+Status: public pre-alpha. The dev gateway can read secret plaintext. Do not treat that process as zero-knowledge. The project has no customers and no certification.
 
-The public HTTP API is the only integration surface. Nothing in it names a particular agent product. A control plane or runner uses the same routes as any other caller. The route list is [API.md](API.md).
+The public HTTP API is the integration surface. The API names no agent product. Read the routes in [API.md](API.md).
 
-## What the control plane holds
+## Control plane
 
-The control plane keeps the workspace credential. It creates secrets, agents, and sessions. It should mint a session that lasts about five minutes, with only `secret:inject:...` scopes, and hand the agent token to the runner. Keep the workspace credential out of the model loop. Prefer that the agent token stays in the runner proxy as well.
+Keep the workspace credential in the control plane. Create secrets, agents, and sessions there. Mint a session of about five minutes. Give the session only `secret:inject:...` scopes. Send the agent token to the runner. Keep the workspace credential out of the model loop. Keep the agent token in the runner proxy.
 
-On a loopback dev listener, `POST /v1/workspaces` is open so a local process can bootstrap. If the process listens on any other address, set `CREDENTIALS_OPERATOR_TOKEN` and send it as `Authorization: Bearer` on workspace creation. The process refuses to start otherwise.
+`POST /v1/workspaces` is open on a loopback dev listener. Set `CREDENTIALS_OPERATOR_TOKEN` when the listen address is not loopback. Send that token as `Authorization: Bearer` on workspace creation. The process exits when the token is absent.
 
-`CREDENTIALS_ISSUER` and `CREDENTIALS_AUDIENCE` override the token issuer and audience. The default issuer is `https://credentials.local/v1`. The default audience is `credentials-gateway`.
+`CREDENTIALS_ISSUER` sets the token issuer. `CREDENTIALS_AUDIENCE` sets the audience. The default issuer is `https://credentials.local/v1`. The default audience is `credentials-gateway`.
 
-## What the runner does
+## Runner
 
-The runner calls `POST /v1/inject` with the agent token and a DPoP proof. Use `proxy` delivery for API keys. The gateway calls the allow-listed HTTPS host, sets the policy header, and returns the upstream response. The secret is not in that response.
+Call `POST /v1/inject` with the agent token and a DPoP proof. Use `proxy` for an API key. The gateway calls the allow-listed HTTPS host. It sets the policy header. The secret is not in the response.
 
-`env` and `header` are refused on the public listener. They belong on the local socket for a runner on the same machine. Set `CREDENTIALS_LOCAL_DIR` to a directory the gateway owns. It listens on `credentials.sock` inside that directory (directory mode `0700`, socket mode `0600`) and drops connections from any other uid. The decoded inject body is `{ "env_name", "value" }` or `{ "header_name", "value" }`. Header delivery does not forward the request.
+The public listener rejects `env` and `header`. Set `CREDENTIALS_LOCAL_DIR` for a runner on the same machine. The socket is `credentials.sock`. The directory mode is `0700`. The socket mode is `0600`. The gateway drops a connection from a different uid. The decoded body is `{ "env_name", "value" }` or `{ "header_name", "value" }`. Header delivery does not forward the request.
 
-## What this build does not do
+Build the DPoP `htu` from the request URL. Do not send a different `htu` in a header. The server uses the `Host` header.
 
-It decrypts in the gateway process. A later production split keeps plaintext out of the control plane. Do not point the dev key file at secrets you cannot afford to lose.
+## Limits of this build
+
+The dev process decrypts `wrap_mode = gateway` rows. The production control plane does not open `wrap_mode = e2e` rows. Do not store a valuable secret in the dev key file.

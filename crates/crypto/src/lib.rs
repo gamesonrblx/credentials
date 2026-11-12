@@ -1,13 +1,12 @@
 //! Envelope encryption for Credentials.
 //!
-//! The wire format follows `docs/ENCRYPTION.md`. AES-256-GCM comes from the
-//! RustCrypto `aes-gcm` crate. Hybrid key transport uses RustCrypto `x-wing`
-//! (X25519 + ML-KEM-768). This crate does not implement a cipher, a KEM, or a
-//! combiner.
+//! The byte layout follows `docs/ENCRYPTION.md`.
+//! AES-256-GCM comes from the RustCrypto `aes-gcm` crate.
+//! X-Wing comes from the RustCrypto `x-wing` crate.
+//! This crate does not implement a cipher, a KEM, or a combiner.
 //!
-//! The dev and in-memory root-key providers exist so the gateway can run
-//! without a cloud KMS. They are refused when `CREDENTIALS_ENV=production`.
-//! They are not a production key store: the dev file holds raw root keys.
+//! The dev root-key file holds raw keys.
+//! `CREDENTIALS_ENV=production` rejects that provider.
 
 #![forbid(unsafe_code)]
 

@@ -1,11 +1,13 @@
 # Security
 
-Credentials stores secrets. Please report vulnerabilities privately.
+Credentials stores secrets. Report a vulnerability in private.
 
 Use GitHub private vulnerability reporting:
 
 https://github.com/tacticocc/credentials/security/advisories/new
 
-Do not open a public GitHub issue for a suspected vulnerability, and do not include secret values, tokens, or key material in a report.
+Do not open a public issue for a suspected vulnerability. Do not include a secret value, a token, or key material in the report.
 
-This repository is pre-alpha. The dev root-key provider writes raw keys to a local file and must not be used in production. `CREDENTIALS_ENV=production` refuses that provider.
+This repository is pre-alpha. The dev key file contains raw keys. Do not use that file in production. `CREDENTIALS_ENV=production` rejects the dev key file, the dev signer, and the dev audit anchor.
+
+The production control plane does not open an end-to-end secret. The customer injector holds the decapsulation key. There is no operator recovery recipient.
