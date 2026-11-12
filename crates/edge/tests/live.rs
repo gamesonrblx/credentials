@@ -85,18 +85,18 @@ fn vault_transit_and_kv_round_trip() {
 fn create_locked_bucket(endpoint: &str, bucket: &str) {
     let url = format!("{endpoint}/{bucket}");
     let (date, stamp) = credentials_edge::amz_now();
-    let auth = credentials_edge::authorization(
+    let (auth, payload_hash) = credentials_edge::s3_authorization(
         "PUT",
         &url,
         b"",
         "us-east-1",
-        "s3",
         "minioadmin",
         "minioadmin",
         &date,
         &stamp,
+        &[("x-amz-bucket-object-lock-enabled", "true")],
     );
-    let status = std::thread::scope(|scope| {
+    let (status, body) = std::thread::scope(|scope| {
         let date = date.clone();
         scope
             .spawn(move || {
@@ -105,21 +105,24 @@ fn create_locked_bucket(endpoint: &str, bucket: &str) {
                     .build()
                     .unwrap()
                     .block_on(async move {
-                        reqwest::Client::new()
+                        let response = reqwest::Client::new()
                             .put(url)
                             .header("Authorization", auth)
                             .header("x-amz-date", date)
+                            .header("x-amz-content-sha256", payload_hash)
                             .header("x-amz-bucket-object-lock-enabled", "true")
                             .send()
                             .await
-                            .unwrap()
-                            .status()
+                            .unwrap();
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        (status, body)
                     })
             })
             .join()
             .unwrap()
     });
-    assert!(status.is_success(), "create bucket {status}");
+    assert!(status.is_success(), "create bucket {status} {body}");
 }
 
 fn enable_transit(endpoint: &str) {

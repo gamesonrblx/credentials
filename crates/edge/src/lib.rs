@@ -12,7 +12,7 @@ pub mod s3lock;
 pub mod vault;
 pub mod webauthn;
 
-pub use aws_kms::{amz_now, authorization, kms_key_policy, AwsKms, KmsError};
+pub use aws_kms::{amz_now, authorization, kms_key_policy, s3_authorization, AwsKms, KmsError};
 pub use importers::{read_doppler, read_infisical, read_onepassword, read_vault_kv, SourceSecret};
 pub use nitro::{verify_attestation, Attestation, NitroError};
 pub use oidc::{authorize_url, exchange_code, CodeChallenge, OidcClient, OidcError};

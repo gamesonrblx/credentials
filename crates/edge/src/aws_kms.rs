@@ -242,6 +242,70 @@ pub fn authorization(
     )
 }
 
+/// SigV4 for S3. The host includes the port, and every `x-amz-*` header is signed.
+/// S3 rejects a request that omits `x-amz-content-sha256` or leaves an `x-amz-*` header unsigned.
+#[allow(clippy::too_many_arguments)]
+pub fn s3_authorization(
+    method: &str,
+    url: &str,
+    payload: &[u8],
+    region: &str,
+    access_key: &str,
+    secret_key: &str,
+    amz_date: &str,
+    date_stamp: &str,
+    extra: &[(&str, &str)],
+) -> (String, String) {
+    let parsed = reqwest::Url::parse(url).expect("url");
+    let host_name = parsed.host_str().unwrap_or("localhost");
+    let host = match parsed.port() {
+        Some(port) => format!("{host_name}:{port}"),
+        None => host_name.to_owned(),
+    };
+    let path = if parsed.path().is_empty() {
+        "/"
+    } else {
+        parsed.path()
+    };
+    let hash = hex_encode(&Sha256::digest(payload));
+    let mut headers = vec![
+        ("host".to_owned(), host),
+        ("x-amz-content-sha256".to_owned(), hash.clone()),
+        ("x-amz-date".to_owned(), amz_date.to_owned()),
+    ];
+    for (name, value) in extra {
+        headers.push((name.to_ascii_lowercase(), value.trim().to_owned()));
+    }
+    headers.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut canonical_headers = String::new();
+    let mut signed = String::new();
+    for (index, (name, value)) in headers.iter().enumerate() {
+        canonical_headers.push_str(name);
+        canonical_headers.push(':');
+        canonical_headers.push_str(value);
+        canonical_headers.push('\n');
+        if index > 0 {
+            signed.push(';');
+        }
+        signed.push_str(name);
+    }
+    let canonical = format!("{method}\n{path}\n\n{canonical_headers}\n{signed}\n{hash}");
+    let scope = format!("{date_stamp}/{region}/s3/aws4_request");
+    let to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        hex_encode(&Sha256::digest(canonical.as_bytes()))
+    );
+    let mut key = signing_key(secret_key, date_stamp, region, "s3");
+    let sig = hex_encode(&hmac_sha256(&key, to_sign.as_bytes()));
+    key.fill(0);
+    (
+        format!(
+            "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed}, Signature={sig}"
+        ),
+        hash,
+    )
+}
+
 fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
     let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
@@ -355,5 +419,27 @@ mod tests {
         );
         assert_eq!(one, two);
         assert!(one.starts_with("AWS4-HMAC-SHA256 "));
+    }
+
+    #[test]
+    fn s3_signature_signs_the_lock_header_and_the_port() {
+        let (header, hash) = s3_authorization(
+            "PUT",
+            "http://127.0.0.1:9000/lock-bucket",
+            b"",
+            "us-east-1",
+            "minioadmin",
+            "minioadmin",
+            "20130524T000000Z",
+            "20130524",
+            &[("x-amz-bucket-object-lock-enabled", "true")],
+        );
+        assert!(header.contains(
+            "SignedHeaders=host;x-amz-bucket-object-lock-enabled;x-amz-content-sha256;x-amz-date"
+        ));
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 }
