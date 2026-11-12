@@ -9,5 +9,17 @@
   <p>This page is public pre-alpha. It claims no customers and no certification.</p>
   <p>Use this page to administer agents, sessions, and the audit log. This page does not decrypt. Secret values stay in the customer injector.</p>
   <p>Admin calls use the workspace credential. Inject routes reject that credential. An agent token cannot call these admin actions.</p>
+  <p id="session">Not signed in.</p>
+  <p><a href="/v1/login">Sign in</a></p>
+  <script>
+    fetch("/v1/session").then(function (response) {
+      if (!response.ok) return null;
+      return response.json();
+    }).then(function (session) {
+      if (!session) return;
+      document.getElementById("session").textContent =
+        "Signed in as " + session.subject + ". This page does not decrypt.";
+    });
+  </script>
 </body>
 </html>

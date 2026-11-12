@@ -133,10 +133,38 @@ async fn main() {
         return;
     }
 
+    if let Some(login) = oidc_login(addr) {
+        let app = credentials_gateway::router_with_login(gateway, operator_token, login);
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                eprintln!("server: {err}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(err) = axum::serve(listener, app).await {
+            eprintln!("server: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if let Err(err) = serve_with(gateway, addr, operator_token).await {
         eprintln!("server: {err}");
         std::process::exit(1);
     }
+}
+
+fn oidc_login(addr: std::net::SocketAddr) -> Option<std::sync::Arc<credentials_gateway::LoginHub>> {
+    let issuer = std::env::var("CREDENTIALS_OIDC_ISSUER").ok()?;
+    let client_id =
+        std::env::var("CREDENTIALS_OIDC_CLIENT_ID").unwrap_or_else(|_| "credentials".into());
+    let secret = std::env::var("CREDENTIALS_OIDC_CLIENT_SECRET").ok();
+    let redirect = std::env::var("CREDENTIALS_OIDC_REDIRECT")
+        .unwrap_or_else(|_| format!("http://{addr}/v1/login/callback"));
+    Some(std::sync::Arc::new(credentials_gateway::LoginHub::new(
+        issuer, client_id, redirect, secret,
+    )))
 }
 
 fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {

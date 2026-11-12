@@ -1,35 +1,24 @@
-//! WebAuthn registration and authentication with a software authenticator.
+//! WebAuthn registration and authentication.
 //!
-//! The PRF output stays in the authenticator. The relying party stores the
-//! public key, the credential id, and the salt. It does not store the PRF
+//! `webauthn-rs` checks the ceremony. The software authenticator keeps the
+//! PRF key. The relying party stores the passkey and does not store the PRF
 //! output.
 
-use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use p256::ecdsa::{Signature, SigningKey};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
+use webauthn_rs::prelude::{
+    CreationChallengeResponse, Passkey, PasskeyRegistration, PublicKeyCredential,
+    RegisterPublicKeyCredential, RequestChallengeResponse, Url, Webauthn, WebauthnBuilder,
+};
 
 #[derive(Debug)]
 pub struct WebauthnError;
 
 pub struct Authenticator {
     signing: SigningKey,
-    credential_id: [u8; 16],
+    credential_id: Vec<u8>,
     prf_key: [u8; 32],
-}
-
-pub struct RelyingParty {
-    pub origin: String,
-    pub rp_id: String,
-    pub credential_id: Vec<u8>,
-    pub public_key: Vec<u8>,
-    pub salt: [u8; 32],
-}
-
-pub struct Registration {
-    pub credential_id: Vec<u8>,
-    pub public_key: Vec<u8>,
-    pub client_data: Vec<u8>,
-    pub auth_data: Vec<u8>,
-    pub signature: Vec<u8>,
 }
 
 impl Authenticator {
@@ -42,56 +31,78 @@ impl Authenticator {
         getrandom::fill(&mut prf).expect("os random");
         Self {
             signing: SigningKey::from_bytes((&seed).into()).expect("p256"),
-            credential_id: id,
+            credential_id: id.to_vec(),
             prf_key: prf,
         }
     }
 
-    pub fn register(&self, challenge: &[u8], rp_id: &str, origin: &str) -> Registration {
-        let client_data = serde_json::json!({
-            "type": "webauthn.create",
-            "challenge": b64(challenge),
-            "origin": origin,
-        });
-        let client_bytes = serde_json::to_vec(&client_data).expect("json");
-        let mut auth_data = Sha256::digest(rp_id.as_bytes()).to_vec();
-        auth_data.push(0x41);
-        auth_data.extend_from_slice(&0u32.to_be_bytes());
-        auth_data.extend_from_slice(&self.credential_id);
-        let public = self.signing.verifying_key().to_sec1_bytes().to_vec();
-        auth_data.extend_from_slice(&(public.len() as u16).to_be_bytes());
-        auth_data.extend_from_slice(&public);
-        let mut signed = auth_data.clone();
-        signed.extend_from_slice(&Sha256::digest(&client_bytes));
-        let signature: Signature = p256::ecdsa::signature::Signer::sign(&self.signing, &signed);
-        Registration {
-            credential_id: self.credential_id.to_vec(),
-            public_key: public,
-            client_data: client_bytes,
-            auth_data,
-            signature: signature.to_bytes().to_vec(),
+    pub fn register(
+        &self,
+        options: &CreationChallengeResponse,
+        origin: &str,
+    ) -> RegisterPublicKeyCredential {
+        let client_data = client_json("webauthn.create", &options.public_key.challenge, origin);
+        let auth_data = self.auth_data(origin_rp(origin), true, 0);
+        let attestation = ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Text("fmt".into()),
+                ciborium::Value::Text("none".into()),
+            ),
+            (
+                ciborium::Value::Text("attStmt".into()),
+                ciborium::Value::Map(Vec::new()),
+            ),
+            (
+                ciborium::Value::Text("authData".into()),
+                ciborium::Value::Bytes(auth_data),
+            ),
+        ]);
+        let mut attestation_object = Vec::new();
+        ciborium::into_writer(&attestation, &mut attestation_object).expect("cbor");
+        RegisterPublicKeyCredential {
+            id: b64(&self.credential_id),
+            raw_id: self.credential_id.clone(),
+            response: webauthn_rs_proto::AuthenticatorAttestationResponseRaw {
+                attestation_object,
+                client_data_json: client_data,
+                transports: None,
+            },
+            type_: "public-key".into(),
+            extensions: webauthn_rs_proto::RegistrationExtensionsClientOutputs {
+                appid: None,
+                cred_props: None,
+                hmac_secret: None,
+                cred_protect: None,
+                min_pin_length: None,
+            },
         }
     }
 
-    pub fn authenticate(&self, challenge: &[u8], rp_id: &str, origin: &str) -> Registration {
-        let client_data = serde_json::json!({
-            "type": "webauthn.get",
-            "challenge": b64(challenge),
-            "origin": origin,
-        });
-        let client_bytes = serde_json::to_vec(&client_data).expect("json");
-        let mut auth_data = Sha256::digest(rp_id.as_bytes()).to_vec();
-        auth_data.push(0x01);
-        auth_data.extend_from_slice(&1u32.to_be_bytes());
-        let mut signed = auth_data.clone();
-        signed.extend_from_slice(&Sha256::digest(&client_bytes));
-        let signature: Signature = p256::ecdsa::signature::Signer::sign(&self.signing, &signed);
-        Registration {
-            credential_id: self.credential_id.to_vec(),
-            public_key: self.signing.verifying_key().to_sec1_bytes().to_vec(),
-            client_data: client_bytes,
-            auth_data,
-            signature: signature.to_bytes().to_vec(),
+    pub fn authenticate(
+        &self,
+        options: &RequestChallengeResponse,
+        origin: &str,
+        counter: u32,
+    ) -> PublicKeyCredential {
+        let client_data = client_json("webauthn.get", &options.public_key.challenge, origin);
+        let auth_data = self.auth_data(origin_rp(origin), false, counter);
+        let mut message = auth_data.clone();
+        message.extend_from_slice(&Sha256::digest(&client_data));
+        let signature: Signature = p256::ecdsa::signature::Signer::sign(&self.signing, &message);
+        PublicKeyCredential {
+            id: b64(&self.credential_id),
+            raw_id: self.credential_id.clone(),
+            response: webauthn_rs_proto::AuthenticatorAssertionResponseRaw {
+                authenticator_data: auth_data,
+                client_data_json: client_data,
+                signature: signature.to_der().as_bytes().to_vec(),
+                user_handle: None,
+            },
+            extensions: webauthn_rs_proto::AuthenticationExtensionsClientOutputs {
+                appid: None,
+                hmac_get_secret: None,
+            },
+            type_: "public-key".into(),
         }
     }
 
@@ -99,89 +110,120 @@ impl Authenticator {
     pub fn prf(&self, salt: &[u8]) -> [u8; 32] {
         crate::aws_kms::hmac_sha256(&self.prf_key, salt)
     }
+
+    fn auth_data(&self, rp_id: &str, attestation: bool, counter: u32) -> Vec<u8> {
+        let mut data = Sha256::digest(rp_id.as_bytes()).to_vec();
+        data.push(if attestation { 0x45 } else { 0x05 });
+        data.extend_from_slice(&counter.to_be_bytes());
+        if attestation {
+            data.extend_from_slice(&[0u8; 16]);
+            data.extend_from_slice(&(self.credential_id.len() as u16).to_be_bytes());
+            data.extend_from_slice(&self.credential_id);
+            data.extend_from_slice(&cose_key(&self.signing));
+        }
+        data
+    }
+}
+
+pub fn relying_party(rp_id: &str, origin: &str) -> Result<Webauthn, WebauthnError> {
+    let url = Url::parse(origin).map_err(|_| WebauthnError)?;
+    WebauthnBuilder::new(rp_id, &url)
+        .map_err(|_| WebauthnError)?
+        .rp_name("Credentials")
+        .build()
+        .map_err(|_| WebauthnError)
 }
 
 pub fn register(
     auth: &Authenticator,
-    challenge: &[u8],
-    rp_id: &str,
+    party: &Webauthn,
+    user: Uuid,
     origin: &str,
-) -> Result<RelyingParty, WebauthnError> {
-    let reg = auth.register(challenge, rp_id, origin);
-    verify_client(&reg.client_data, "webauthn.create", challenge, origin)?;
-    verify_signature(
-        &reg.public_key,
-        &reg.auth_data,
-        &reg.client_data,
-        &reg.signature,
-    )?;
-    if &reg.auth_data[..32] != Sha256::digest(rp_id.as_bytes()).as_slice() {
-        return Err(WebauthnError);
-    }
-    Ok(RelyingParty {
-        origin: origin.to_owned(),
-        rp_id: rp_id.to_owned(),
-        credential_id: reg.credential_id,
-        public_key: reg.public_key,
-        salt: *b"credentials-prf-salt-32-bytes!!!",
-    })
+) -> Result<(Passkey, PasskeyRegistration), WebauthnError> {
+    let (options, state) = party
+        .start_passkey_registration(user, "ada", "Ada", None)
+        .map_err(|_| WebauthnError)?;
+    let credential = auth.register(&options, origin);
+    let passkey = party
+        .finish_passkey_registration(&credential, &state)
+        .map_err(|_| WebauthnError)?;
+    Ok((passkey, state))
 }
 
 pub fn authenticate(
-    party: &RelyingParty,
     auth: &Authenticator,
-    challenge: &[u8],
-) -> Result<(), WebauthnError> {
-    let assertion = auth.authenticate(challenge, &party.rp_id, &party.origin);
-    if assertion.credential_id != party.credential_id {
-        return Err(WebauthnError);
-    }
-    verify_client(
-        &assertion.client_data,
-        "webauthn.get",
-        challenge,
-        &party.origin,
-    )?;
-    verify_signature(
-        &party.public_key,
-        &assertion.auth_data,
-        &assertion.client_data,
-        &assertion.signature,
-    )
-}
-
-fn verify_client(
-    bytes: &[u8],
-    kind: &str,
-    challenge: &[u8],
+    party: &Webauthn,
+    passkey: &Passkey,
     origin: &str,
 ) -> Result<(), WebauthnError> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| WebauthnError)?;
-    if value.get("type").and_then(|v| v.as_str()) != Some(kind) {
-        return Err(WebauthnError);
-    }
-    if value.get("origin").and_then(|v| v.as_str()) != Some(origin) {
-        return Err(WebauthnError);
-    }
-    if value.get("challenge").and_then(|v| v.as_str()) != Some(b64(challenge).as_str()) {
-        return Err(WebauthnError);
-    }
-    Ok(())
+    let (options, state) = party
+        .start_passkey_authentication(std::slice::from_ref(passkey))
+        .map_err(|_| WebauthnError)?;
+    let assertion = auth.authenticate(&options, origin, 1);
+    party
+        .finish_passkey_authentication(&assertion, &state)
+        .map(|_| ())
+        .map_err(|_| WebauthnError)
 }
 
-fn verify_signature(
-    public: &[u8],
-    auth_data: &[u8],
-    client_data: &[u8],
-    signature: &[u8],
-) -> Result<(), WebauthnError> {
-    let key = VerifyingKey::from_sec1_bytes(public).map_err(|_| WebauthnError)?;
-    let sig = Signature::from_slice(signature).map_err(|_| WebauthnError)?;
-    let mut message = auth_data.to_vec();
-    message.extend_from_slice(&Sha256::digest(client_data));
-    p256::ecdsa::signature::Verifier::verify(&key, &message, &sig).map_err(|_| WebauthnError)
+pub fn stored_passkey_hides_prf(passkey: &Passkey, prf: &[u8]) -> bool {
+    let stored = serde_json::to_string(passkey).unwrap_or_default();
+    !stored.contains(&hex(prf))
+}
+
+fn cose_key(signing: &SigningKey) -> Vec<u8> {
+    let point = signing.verifying_key().to_sec1_bytes();
+    let x = point[1..33].to_vec();
+    let y = point[33..65].to_vec();
+    let key = ciborium::Value::Map(vec![
+        (
+            ciborium::Value::Integer(1.into()),
+            ciborium::Value::Integer(2.into()),
+        ),
+        (
+            ciborium::Value::Integer(3.into()),
+            ciborium::Value::Integer((-7).into()),
+        ),
+        (
+            ciborium::Value::Integer((-1).into()),
+            ciborium::Value::Integer(1.into()),
+        ),
+        (
+            ciborium::Value::Integer((-2).into()),
+            ciborium::Value::Bytes(x),
+        ),
+        (
+            ciborium::Value::Integer((-3).into()),
+            ciborium::Value::Bytes(y),
+        ),
+    ]);
+    let mut out = Vec::new();
+    ciborium::into_writer(&key, &mut out).expect("cbor");
+    out
+}
+
+fn client_json(kind: &str, challenge: &[u8], origin: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "type": kind,
+        "challenge": b64(challenge),
+        "origin": origin,
+    }))
+    .expect("json")
+}
+
+fn origin_rp(origin: &str) -> &str {
+    origin
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(origin)
 }
 
 fn b64(bytes: &[u8]) -> String {
     base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

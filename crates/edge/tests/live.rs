@@ -4,7 +4,7 @@
 //! URLs. A normal `cargo test` skips these when that variable is absent.
 
 use credentials_crypto::{KekContext, RootKeyProvider};
-use credentials_edge::{read_vault_kv, AwsKms, VaultTransit};
+use credentials_edge::{login_with_password, read_vault_kv, AwsKms, OidcClient, VaultTransit};
 use uuid::Uuid;
 
 fn required(name: &str) -> Option<String> {
@@ -80,6 +80,21 @@ fn vault_transit_and_kv_round_trip() {
     let rows = read_vault_kv(&endpoint, "root", "secret", "imports").expect("kv");
     assert_eq!(rows[0].name, "OPENAI_API_KEY");
     assert_eq!(rows[0].value, "sk-vault");
+}
+
+#[test]
+fn dex_login_returns_the_email() {
+    let Some(issuer) = required("CREDENTIALS_TEST_DEX") else {
+        return;
+    };
+    let client = OidcClient {
+        issuer,
+        client_id: "credentials".into(),
+        redirect_uri: "http://127.0.0.1:8080/v1/login/callback".into(),
+    };
+    let session = login_with_password(&client, Some("secret"), "admin@example.com", "password")
+        .expect("dex login");
+    assert_eq!(session.subject, "admin@example.com");
 }
 
 fn create_locked_bucket(endpoint: &str, bucket: &str) {

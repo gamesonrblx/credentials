@@ -56,16 +56,16 @@ Infisical, Doppler, and 1Password tests use recorded HTTP shapes.
 They do not call the paid vendor APIs.
 There is no real Nitro hardware path.
 `credentials-edge` checks a test PCR document.
-That check is not `COSE_Sign1` and not the AWS Nitro certificate chain.
+`verify_attestation` checks a `COSE_Sign1` document, ES384, and the certificate chain to a root the caller pins. CI signs that document with a test root. An EIF still needs the Nitro CLI on a Nitro host.
 An EIF build needs Nitro hardware.
 Vault Transit and AWS KMS adapters are in `credentials-edge`.
 A customer process or a dev process can call those adapters.
 `Gateway::control_plane` does not call those adapters.
 A paid AWS account is not required for the LocalStack test.
 `credentials-edge` has a WebAuthn software authenticator for tests.
-It is not the `webauthn-rs` crate.
+Registration and authentication go through `webauthn-rs`. The PRF output stays in the authenticator.
 `credentials-edge` has OIDC PKCE helpers.
-The static dashboard does not complete a login yet.
+`GET /v1/login` starts an OIDC authorization-code flow. The callback stores a session subject. The dashboard page does not decrypt.
 SAML is not implemented.
 The dashboard HTML does not decrypt a secret.
 
@@ -155,7 +155,7 @@ These items are still absent.
 There is no live hosted service.
 Default CI does not use S3 Object Lock.
 There is no Nitro EIF and no live Nitro path.
-The tree has no full `COSE_Sign1` AWS chain verifier.
+`credentials-edge` verifies a `COSE_Sign1` ES384 document against a caller-pinned root. CI uses a test root. The tree has no Nitro EIF.
 SAML is not implemented.
 The dashboard HTML does not decrypt a secret.
 `Gateway::control_plane` does not call the Vault Transit adapter or the AWS KMS adapter.
@@ -301,7 +301,7 @@ An operator with a decrypt role on the dev gateway can open those rows.
 Section 12 is the start for architecture (i) below.
 The live enclave path is not built.
 `credentials-edge` has a test PCR document.
-The tree has no Nitro EIF, no live Nitro path, and no full `COSE_Sign1` AWS chain verifier.
+The tree has no Nitro EIF and no live Nitro path. `credentials-edge` verifies a `COSE_Sign1` ES384 document against a caller-pinned root. CI uses a test root.
 [docs/ARCHITECTURE.md](ARCHITECTURE.md) records the target split, the enclave key-release flow, and account-bound recovery.
 
 ### Architecture (i) — customer-run injector
@@ -361,7 +361,7 @@ That is the same exposure the upstream already has in proxy mode.
 
 This path is not a live enclave.
 `credentials-edge` checks a test PCR document.
-The tree has no Nitro EIF and no full `COSE_Sign1` AWS chain verifier.
+The tree has no Nitro EIF. `credentials-edge` verifies a `COSE_Sign1` ES384 document against a caller-pinned root. CI uses a test root.
 [docs/ARCHITECTURE.md](ARCHITECTURE.md) is the design note.
 Hardware attestation trusts the CPU vendor and the published measurement.
 It does not claim that the operator cannot affect availability.
@@ -505,7 +505,7 @@ There is no live hosted service in this tree.
 ### Deliverables
 
 - Deploy the M4 control plane for the hosted beta. It stores ciphertext, policy, tokens, and the audit log. It does not store a decapsulation key. It has no KMS `Decrypt` permission on keys that wrap customer secrets. It does not run the dev root-key provider. It uses `RejectingRootKeys`.
-- Hosted injection, if it is offered, runs only as architecture (ii) from M3. That is an attested enclave, with key release bound to the measurement. Operator staff and the host cannot unwrap keys. The tree has no live enclave. It has a test PCR document in `credentials-edge` and no full `COSE_Sign1` AWS chain verifier. If the enclave path is not in this beta, callers use `credentials-injector` against the hosted control plane. There is no mode in which a normal Tactico process decrypts.
+- Hosted injection, if it is offered, runs only as architecture (ii) from M3. That is an attested enclave, with key release bound to the measurement. Operator staff and the host cannot unwrap keys. The tree has no live enclave. `credentials-edge` verifies a `COSE_Sign1` ES384 document against a caller-pinned root. CI uses a test root. If the enclave path is not in this beta, callers use `credentials-injector` against the hosted control plane. There is no mode in which a normal Tactico process decrypts.
 - Use a hosted audit anchor with a retention lock.
 - S3 Object Lock or an equivalent meets that rule.
 - Key each object by `{workspace_id}/{seq}`. The publisher can put objects and cannot delete them. The database role has no permission on the bucket. Default CI does not use S3 Object Lock. `credentials-edge` can send an object with compliance-mode headers. Default CI does not start that store.
@@ -621,7 +621,7 @@ M3, M4, and M5 require it.
 8. **Recovery ceremony details.** The account-bound model is specified in [docs/ARCHITECTURE.md](ARCHITECTURE.md) and is an M3 deliverable. It includes multi-recipient wrap, device enrollment, WebAuthn PRF passkeys, an offline recovery kit, optional admin re-share, and no operator recipient. `credentials-edge` has a software authenticator. Authentication does not recover keys. Loss of every recipient loses the data. Still open: the exact recovery-kit encoding, and which passkey transports the first client supports. The operator must not hold a recovery key.
 9. **Hosted injection mechanism.** Architecture (i) is sufficient for the M5 exit criteria. The injector exists. The beta can add architecture (ii) later.
 Choose the first enclave technology at that time.
-Do not add a hosted process that can decrypt. There is no live hosted service, no Nitro EIF, and no full `COSE_Sign1` AWS chain verifier.
+Do not add a hosted process that can decrypt. There is no live hosted service and no Nitro EIF. `credentials-edge` verifies a `COSE_Sign1` ES384 document against a caller-pinned root. CI uses a test root.
 10. **Audit retention after shred.** The default is 90 days, as a per-workspace setting, for audit metadata. Does any anticipated contract require immediate deletion of that metadata, including retention-locked anchors? Destruction of client-held keys shreds e2e payloads. Default CI does not use S3 Object Lock.
 11. **Second person to approve shred.** For client-held keys, shred is destruction of the decapsulation key and the recovery recipients. Is a two-person rule required for a hosted operator console? The operator already cannot open the secret.
 12. **`reveal` for humans, multi-region, and hybrid token signatures.**

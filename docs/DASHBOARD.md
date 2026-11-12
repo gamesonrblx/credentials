@@ -15,6 +15,6 @@ The dashboard can revoke a session and a recovery recipient. It cannot show a se
 
 Login does not recover the workspace key. The customer enrolls devices and recovery recipients. The page can list recipient kinds and can revoke one. The page never receives a PRF output, a recovery-kit secret, or a decapsulation key.
 
-`credentials-edge` can start an OIDC authorization-code flow with PKCE. The group `credentials-admin` maps to the admin role. The group name `inject` is not a role. SAML is not implemented. The workspace credential remains the admin bearer until a full login ships.
+`GET /v1/login` starts an OIDC authorization-code flow with PKCE. The callback reads the userinfo email and stores a session subject. The group `credentials-admin` maps to the admin role. The group name `inject` is not a role. SAML is not implemented. The session cookie is not accepted on inject routes.
 
-`dashboard/index.html` is a static page. It does not call inject. It has no field for a secret value.
+`GET /dashboard` serves `dashboard/index.html`. The page shows the session subject. It does not call inject. It has no field for a secret value.

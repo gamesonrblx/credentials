@@ -363,7 +363,7 @@ Attestation trusts the CPU vendor and the measurement the customer pinned.
 It does not stop the host from a refusal to schedule the enclave.
 `credentials-edge` checks a test PCR document.
 The tree has no Nitro EIF.
-The tree has no full `COSE_Sign1` AWS chain verifier.
+`credentials-edge` verifies a `COSE_Sign1` ES384 document against a caller-pinned root. CI uses a test root. The tree has no Nitro EIF.
 If this path is not ready, hosted production uses the injector.
 It does not use a normal process that decrypts.
 
@@ -712,7 +712,7 @@ The encryption spec remains normative for the envelope.
 - DPoP `htu` comes from the request host and the TLS flag. The handler does not read `x-dpop-htu`. The migration creates `revoked_jtis`. The gateway code does not read that table yet. A disabled agent, a failed DPoP proof, or a replayed DPoP `jti` returns 401 without an audit row. `secret.access.delivered` and `secret.access.failed` ignore an append error. The allow event does not.
 - Workspace delete revokes sessions, deletes secret rows, and schedules shred. A poller sets `shredded`. Cancel exists while destruction is pending. The migration creates `rewrap_jobs`. KEK rotation rewraps data keys in the gateway process.
 - The public listener rejects `env` and `header`. The local socket (`CREDENTIALS_LOCAL_DIR`, mode `0700`, same-uid peer check) returns `{ env_name, value }` or `{ header_name, value }`. It does not forward header delivery through `Upstream`.
-- `credentials-edge` has Vault Transit, AWS KMS, a WebAuthn software authenticator, and OIDC PKCE helpers. `Gateway::control_plane` does not call the KMS adapters. SAML is not implemented. The dashboard HTML does not decrypt. There is no live hosted service. Default CI does not use S3 Object Lock. There is no Nitro EIF. There is no full `COSE_Sign1` AWS chain verifier. The edge crate checks a test PCR document, not a live enclave. PKCS#11 is not in the tree. The production signer is still a `DevSigner` argument on `Gateway::control_plane`.
+- `credentials-edge` has Vault Transit, AWS KMS, a WebAuthn software authenticator, and OIDC PKCE helpers. `Gateway::control_plane` does not call the KMS adapters. SAML is not implemented. The dashboard HTML does not decrypt. There is no live hosted service. Default CI does not use S3 Object Lock. There is no Nitro EIF. `credentials-edge` verifies a `COSE_Sign1` ES384 document against a caller-pinned root. CI uses a test root, not a live enclave. PKCS#11 is not in the tree. The production signer is still a `DevSigner` argument on `Gateway::control_plane`.
 
 ## 10. Related documents
 

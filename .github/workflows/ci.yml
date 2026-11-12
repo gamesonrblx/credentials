@@ -139,6 +139,7 @@ jobs:
           CREDENTIALS_TEST_KMS: http://127.0.0.1:4566
           CREDENTIALS_TEST_MINIO: http://127.0.0.1:9000
           CREDENTIALS_TEST_VAULT: http://127.0.0.1:8200
+          CREDENTIALS_TEST_DEX: http://127.0.0.1:5556/dex
           CREDENTIALS_TEST_POSTGRES: postgres://credentials:credentials@localhost:5432/credentials?sslmode=disable
 
   deny:

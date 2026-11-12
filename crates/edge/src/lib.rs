@@ -14,11 +14,14 @@ pub mod webauthn;
 
 pub use aws_kms::{amz_now, authorization, kms_key_policy, s3_authorization, AwsKms, KmsError};
 pub use importers::{read_doppler, read_infisical, read_onepassword, read_vault_kv, SourceSecret};
-pub use nitro::{verify_attestation, Attestation, NitroError};
-pub use oidc::{authorize_url, exchange_code, CodeChallenge, OidcClient, OidcError};
+pub use nitro::{seal_document, sha256_der, verify_attestation, Attestation, NitroError};
+pub use oidc::{
+    authorize_url, exchange_code, finish_browser_login, login_with_password, start_browser_login,
+    BrowserLogin, CodeChallenge, HumanLogin, OidcClient, OidcError,
+};
 pub use s3lock::{put_locked, LockError, LockedObject};
 pub use vault::VaultTransit;
-pub use webauthn::{authenticate, register, Authenticator, RelyingParty, WebauthnError};
+pub use webauthn::{authenticate, register, relying_party, Authenticator, WebauthnError};
 
 #[cfg(test)]
 mod tests;

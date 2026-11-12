@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::login::{self, SharedLogin};
 use crate::policy::{Delivery, DeliveryPolicy};
 use crate::service::{
     CreatedSession, CreatedVersion, CreatedWorkspace, E2eSubmission, Gateway, InjectRequest,
@@ -29,6 +30,8 @@ pub struct AppState {
     pub local_channel: bool,
     /// True when this router is behind the TLS listener. DPoP `htu` uses it.
     pub tls: bool,
+    /// Human dashboard login. Absent on the local inject socket.
+    pub login: Option<SharedLogin>,
 }
 
 pub fn router(gateway: Arc<Gateway>) -> Router {
@@ -41,6 +44,21 @@ pub fn router_with_bootstrap(gateway: Arc<Gateway>, operator_token: Option<Strin
         operator_token,
         local_channel: false,
         tls: false,
+        login: None,
+    })
+}
+
+pub fn router_with_login(
+    gateway: Arc<Gateway>,
+    operator_token: Option<String>,
+    login: SharedLogin,
+) -> Router {
+    routes().with_state(AppState {
+        gateway,
+        operator_token,
+        local_channel: false,
+        tls: false,
+        login: Some(login),
     })
 }
 
@@ -51,6 +69,7 @@ pub fn router_tls(gateway: Arc<Gateway>, operator_token: Option<String>) -> Rout
         operator_token,
         local_channel: false,
         tls: true,
+        login: None,
     })
 }
 
@@ -61,6 +80,7 @@ pub fn router_local(gateway: Arc<Gateway>) -> Router {
         operator_token: None,
         local_channel: true,
         tls: false,
+        login: None,
     })
 }
 
@@ -94,6 +114,10 @@ fn routes() -> Router<AppState> {
             post(revoke_recipient),
         )
         .route("/v1/e2e-secrets", post(store_e2e_secret))
+        .route("/v1/login", get(login::begin))
+        .route("/v1/login/callback", get(login::callback))
+        .route("/v1/session", get(login::session))
+        .route("/dashboard", get(login::dashboard))
 }
 
 async fn health() -> StatusCode {

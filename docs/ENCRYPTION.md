@@ -1397,7 +1397,7 @@ A hosted or self-hosted control plane releases ciphertext for `wrap_mode=e2e` an
 There is no operator recovery recipient.
 An attested enclave is not built as a live path.
 `credentials-edge` checks a test PCR document.
-The tree has no Nitro EIF and no full `COSE_Sign1` AWS chain verifier.
+`credentials-edge` verifies a `COSE_Sign1` ES384 document against a caller-pinned root. CI uses a test root. The tree has no Nitro EIF.
 There is no live hosted service.
 Hosted injection uses the injector.
 
