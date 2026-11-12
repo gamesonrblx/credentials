@@ -21,8 +21,8 @@ use uuid::Uuid;
 use crate::audit::{commit_event, AuditDraft, AuditRecord, AuditValue};
 use crate::policy::DeliveryPolicy;
 use crate::store::{
-    ensure_recipient, ensure_stored, AgentRow, CheckpointRow, KekRow, RecipientRow, SecretRow,
-    SessionRow, Store, VersionRow, WorkspaceKeyRow, WorkspaceRow, WrapMode,
+    ensure_recipient, ensure_stored, AgentRow, CheckpointRow, KekRow, RecipientRow, RewrapJobRow,
+    SecretRow, SessionRow, Store, VersionRow, WorkspaceKeyRow, WorkspaceRow, WrapMode,
 };
 use crate::ApiError;
 
@@ -149,6 +149,7 @@ macro_rules! session_from {
             scopes: serde_json::from_str(&scopes).map_err(|_| ApiError::StoreUnavailable)?,
             expires_at: u64_from($row.try_get("expires_at").map_err(map_db)?)?,
             revoked_at: revoked.map(u64_from).transpose()?,
+            token_jti: $row.try_get("token_jti").map_err(map_db)?,
         })
     }};
 }
@@ -576,7 +577,7 @@ impl Store for SqlStore {
         let scopes = serde_json::to_string(&row.scopes).map_err(|_| ApiError::StoreUnavailable)?;
         on_pool!(
             self,
-            "INSERT INTO agent_sessions (id, workspace_id, agent_id, dpop_jkt, scopes, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO agent_sessions (id, workspace_id, agent_id, dpop_jkt, scopes, expires_at, revoked_at, token_jti) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             |db, q| {
                 sqlx::query(q)
                     .bind(row.id)
@@ -586,6 +587,7 @@ impl Store for SqlStore {
                     .bind(&scopes)
                     .bind(i64_from(row.expires_at)?)
                     .bind(row.revoked_at.map(i64_from).transpose()?)
+                    .bind(row.token_jti)
                     .execute(db)
                     .await
                     .map_err(map_db)?;
@@ -597,7 +599,7 @@ impl Store for SqlStore {
     async fn session(&self, id: Uuid) -> Result<SessionRow, ApiError> {
         on_pool!(
             self,
-            "SELECT id, workspace_id, agent_id, dpop_jkt, scopes, expires_at, revoked_at FROM agent_sessions WHERE id = ?",
+            "SELECT id, workspace_id, agent_id, dpop_jkt, scopes, expires_at, revoked_at, token_jti FROM agent_sessions WHERE id = ?",
             |db, q| {
                 let row = sqlx::query(q)
                     .bind(id)
@@ -819,6 +821,17 @@ impl Store for SqlStore {
     async fn revoke_workspace_sessions(&self, workspace_id: Uuid, at: u64) -> Result<(), ApiError> {
         on_pool!(
             self,
+            "INSERT INTO revoked_jtis (jti, workspace_id, expires_at) SELECT token_jti, workspace_id, expires_at FROM agent_sessions WHERE workspace_id = ? AND token_jti IS NOT NULL AND revoked_at IS NULL",
+            |db, q| {
+                sqlx::query(q)
+                    .bind(workspace_id)
+                    .execute(db)
+                    .await
+                    .map_err(map_db)?;
+            }
+        );
+        on_pool!(
+            self,
             "UPDATE agent_sessions SET revoked_at = ? WHERE workspace_id = ? AND revoked_at IS NULL",
             |db, q| {
                 sqlx::query(q)
@@ -986,7 +999,7 @@ impl Store for SqlStore {
     async fn list_sessions(&self, workspace_id: Uuid) -> Result<Vec<SessionRow>, ApiError> {
         on_pool!(
             self,
-            "SELECT id, workspace_id, agent_id, dpop_jkt, scopes, expires_at, revoked_at FROM agent_sessions WHERE workspace_id = ?",
+            "SELECT id, workspace_id, agent_id, dpop_jkt, scopes, expires_at, revoked_at, token_jti FROM agent_sessions WHERE workspace_id = ?",
             |db, q| {
                 let rows = sqlx::query(q)
                     .bind(workspace_id)
@@ -1121,6 +1134,172 @@ impl Store for SqlStore {
                 } else {
                     Ok(())
                 }
+            }
+        )
+    }
+
+    async fn revoke_jti(
+        &self,
+        jti: Uuid,
+        workspace_id: Uuid,
+        expires_at: u64,
+    ) -> Result<(), ApiError> {
+        on_pool!(
+            self,
+            "INSERT INTO revoked_jtis (jti, workspace_id, expires_at) VALUES (?, ?, ?)",
+            |db, q| {
+                sqlx::query(q)
+                    .bind(jti)
+                    .bind(workspace_id)
+                    .bind(i64_from(expires_at)?)
+                    .execute(db)
+                    .await
+                    .map_err(map_db)?;
+                Ok(())
+            }
+        )
+    }
+
+    async fn jti_is_revoked(&self, jti: Uuid, now: u64) -> Result<bool, ApiError> {
+        on_pool!(
+            self,
+            "SELECT expires_at FROM revoked_jtis WHERE jti = ?",
+            |db, q| {
+                let row = sqlx::query(q)
+                    .bind(jti)
+                    .fetch_optional(db)
+                    .await
+                    .map_err(map_db)?;
+                let Some(row) = row else {
+                    return Ok(false);
+                };
+                let expires: i64 = row.try_get("expires_at").map_err(map_db)?;
+                Ok(u64_from(expires)? > now)
+            }
+        )
+    }
+
+    async fn claim_dpop_jti(
+        &self,
+        jti: &str,
+        workspace_id: Uuid,
+        expires_at: u64,
+    ) -> Result<(), ApiError> {
+        let inserted = on_pool!(
+            self,
+            "INSERT INTO dpop_replay (jti, workspace_id, expires_at) VALUES (?, ?, ?)",
+            |db, q| {
+                match sqlx::query(q)
+                    .bind(jti)
+                    .bind(workspace_id)
+                    .bind(i64_from(expires_at)?)
+                    .execute(db)
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(err) => {
+                        if let Some(db) = err.as_database_error() {
+                            if db.is_unique_violation() {
+                                Ok(false)
+                            } else {
+                                Err(map_db(err))
+                            }
+                        } else {
+                            Err(map_db(err))
+                        }
+                    }
+                }
+            }
+        )?;
+        if inserted {
+            Ok(())
+        } else {
+            Err(ApiError::Unauthenticated)
+        }
+    }
+
+    async fn purge_dpop(&self, now: u64) -> Result<(), ApiError> {
+        on_pool!(
+            self,
+            "DELETE FROM dpop_replay WHERE expires_at <= ?",
+            |db, q| {
+                sqlx::query(q)
+                    .bind(i64_from(now)?)
+                    .execute(db)
+                    .await
+                    .map_err(map_db)?;
+                Ok(())
+            }
+        )
+    }
+
+    async fn insert_rewrap_job(&self, job: RewrapJobRow) -> Result<(), ApiError> {
+        on_pool!(
+            self,
+            "INSERT INTO rewrap_jobs (id, workspace_id, from_kek_id, to_kek_id, status, wrapped_count) VALUES (?, ?, ?, ?, ?, ?)",
+            |db, q| {
+                sqlx::query(q)
+                    .bind(job.id)
+                    .bind(job.workspace_id)
+                    .bind(job.from_kek_id)
+                    .bind(job.to_kek_id)
+                    .bind(&job.status)
+                    .bind(i64::try_from(job.wrapped_count).unwrap_or(i64::MAX))
+                    .execute(db)
+                    .await
+                    .map_err(map_db)?;
+                Ok(())
+            }
+        )
+    }
+
+    async fn finish_rewrap_job(
+        &self,
+        id: Uuid,
+        status: &str,
+        wrapped_count: u64,
+    ) -> Result<(), ApiError> {
+        let changed = on_pool!(
+            self,
+            "UPDATE rewrap_jobs SET status = ?, wrapped_count = ?, finished_at = ? WHERE id = ?",
+            |db, q| {
+                sqlx::query(q)
+                    .bind(status)
+                    .bind(i64::try_from(wrapped_count).unwrap_or(i64::MAX))
+                    .bind(now_nanos())
+                    .bind(id)
+                    .execute(db)
+                    .await
+                    .map_err(map_db)?
+                    .rows_affected()
+            }
+        );
+        if changed == 0 {
+            Err(ApiError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn pending_rewrap_jobs(&self) -> Result<Vec<RewrapJobRow>, ApiError> {
+        on_pool!(
+            self,
+            "SELECT id, workspace_id, from_kek_id, to_kek_id, status, wrapped_count FROM rewrap_jobs WHERE status = 'pending'",
+            |db, q| {
+                let rows = sqlx::query(q).fetch_all(db).await.map_err(map_db)?;
+                rows.iter()
+                    .map(|row| {
+                        let count: i64 = row.try_get("wrapped_count").map_err(map_db)?;
+                        Ok(RewrapJobRow {
+                            id: row.try_get("id").map_err(map_db)?,
+                            workspace_id: row.try_get("workspace_id").map_err(map_db)?,
+                            from_kek_id: row.try_get("from_kek_id").map_err(map_db)?,
+                            to_kek_id: row.try_get("to_kek_id").map_err(map_db)?,
+                            status: row.try_get("status").map_err(map_db)?,
+                            wrapped_count: u64::try_from(count).unwrap_or(0),
+                        })
+                    })
+                    .collect()
             }
         )
     }

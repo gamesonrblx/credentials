@@ -29,8 +29,8 @@ use crate::policy::{
     scope_allows, validate_policy, Delivery, DeliveryPolicy,
 };
 use crate::store::{
-    AgentRow, KekRow, RecipientRow, SecretRow, SessionRow, Store, VersionRow, WorkspaceKeyRow,
-    WorkspaceRow, WrapMode,
+    AgentRow, KekRow, RecipientRow, RewrapJobRow, SecretRow, SessionRow, Store, VersionRow,
+    WorkspaceKeyRow, WorkspaceRow, WrapMode,
 };
 use crate::token::{AgentClaims, DevSigner, DEFAULT_TTL_SECS, MAX_TTL_SECS};
 use crate::upstream::{Outbound, Upstream};
@@ -112,7 +112,6 @@ pub struct Gateway {
     clock: Arc<dyn Now>,
     kek_cache: Mutex<HashMap<Uuid, CachedKek>>,
     kek_flight: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
-    dpop_seen: Mutex<HashMap<String, u64>>,
     anchor_track: Mutex<AnchorTrack>,
     pub metrics_integrity: AtomicU64,
     unwrap_secrets: bool,
@@ -226,7 +225,6 @@ impl Gateway {
             clock,
             kek_cache: Mutex::new(HashMap::new()),
             kek_flight: Mutex::new(HashMap::new()),
-            dpop_seen: Mutex::new(HashMap::new()),
             anchor_track: Mutex::new(AnchorTrack {
                 started_at,
                 last_checkpoint_at: HashMap::new(),
@@ -264,7 +262,6 @@ impl Gateway {
             clock,
             kek_cache: Mutex::new(HashMap::new()),
             kek_flight: Mutex::new(HashMap::new()),
-            dpop_seen: Mutex::new(HashMap::new()),
             anchor_track: Mutex::new(AnchorTrack {
                 started_at,
                 last_checkpoint_at: HashMap::new(),
@@ -690,6 +687,7 @@ impl Gateway {
         let jkt = dpop::thumbprint(dpop_public_b64);
         let now = self.clock.unix_secs();
         let session_id = Uuid::now_v7();
+        let token_jti = Uuid::now_v7();
         let exp = now + ttl;
         self.store
             .insert_session(SessionRow {
@@ -700,12 +698,13 @@ impl Gateway {
                 scopes: scopes.clone(),
                 expires_at: exp,
                 revoked_at: None,
+                token_jti: Some(token_jti),
             })
             .await?;
         let claims = AgentClaims {
             exp,
             iat: now,
-            jti: Uuid::now_v7(),
+            jti: token_jti,
             workspace_id: workspace.id,
             agent_id,
             session_id,
@@ -739,6 +738,11 @@ impl Gateway {
         }
         let now = self.clock.unix_secs();
         self.store.revoke_session(session_id, now).await?;
+        if let Some(jti) = session.token_jti {
+            self.store
+                .revoke_jti(jti, workspace.id, session.expires_at)
+                .await?;
+        }
         self.store
             .append_audit(self.audit(
                 workspace.id,
@@ -751,12 +755,10 @@ impl Gateway {
     }
 
     pub async fn inject(&self, request: InjectRequest) -> Result<InjectResponse, ApiError> {
-        let claims = self.signer.verify(
-            &request.token,
-            &self.issuer,
-            &self.audience,
-            self.clock.unix_secs(),
-        )?;
+        let now = self.clock.unix_secs();
+        let claims = self
+            .signer
+            .verify(&request.token, &self.issuer, &self.audience, now)?;
         let workspace = self.store.workspace(claims.workspace_id).await?;
         if workspace.status != "active" {
             self.audit_or_fail(
@@ -770,6 +772,9 @@ impl Gateway {
             )
             .await?;
             return Err(ApiError::WorkspaceDeleting);
+        }
+        if self.store.jti_is_revoked(claims.jti, now).await? {
+            return Err(ApiError::Unauthenticated);
         }
         let session = self.store.session(claims.session_id).await?;
         if session.revoked_at.is_some()
@@ -801,7 +806,9 @@ impl Gateway {
         if proof.jkt != claims.jkt {
             return Err(ApiError::Unauthenticated);
         }
-        self.remember_dpop(&proof.jti, self.clock.unix_secs())?;
+        self.store
+            .claim_dpop_jti(&proof.jti, workspace.id, now + 900)
+            .await?;
 
         let secret = match self
             .store
@@ -1074,6 +1081,17 @@ impl Gateway {
             .kms
             .encrypt(&workspace.kms_key_ref, raw.as_slice(), &context)
             .map_err(map_crypto)?;
+        let job_id = Uuid::now_v7();
+        self.store
+            .insert_rewrap_job(RewrapJobRow {
+                id: job_id,
+                workspace_id: workspace.id,
+                from_kek_id: old.id,
+                to_kek_id: new_id,
+                status: "pending".into(),
+                wrapped_count: 0,
+            })
+            .await?;
         self.store
             .swap_active_kek(
                 old.id,
@@ -1091,11 +1109,17 @@ impl Gateway {
             .rewrap_outstanding_keks(&workspace, old.id, new_id, new_version)
             .await?;
         if wrapped_rows > 0 && !self.store.versions_for_kek(old.id).await?.is_empty() {
+            self.store
+                .finish_rewrap_job(job_id, "failed", wrapped_rows)
+                .await?;
             return Err(ApiError::DecryptFailed);
         }
         if self.store.versions_for_kek(old.id).await?.is_empty() {
             self.store.set_kek_status(old.id, "retired").await?;
         }
+        self.store
+            .finish_rewrap_job(job_id, "done", wrapped_rows)
+            .await?;
         self.store
             .append_audit(self.audit(
                 workspace.id,
@@ -1533,14 +1557,23 @@ impl Gateway {
             .map(|_| ())
     }
 
-    fn remember_dpop(&self, jti: &str, now: u64) -> Result<(), ApiError> {
-        let mut seen = self.dpop_seen.lock().expect("dpop lock");
-        seen.retain(|_, exp| *exp + 900 > now);
-        if seen.contains_key(jti) {
-            return Err(ApiError::Unauthenticated);
+    pub async fn purge_dpop(&self) -> Result<(), ApiError> {
+        self.store.purge_dpop(self.clock.unix_secs()).await
+    }
+
+    pub async fn resume_rewrap_jobs(&self) -> Result<u64, ApiError> {
+        let mut total = 0u64;
+        for job in self.store.pending_rewrap_jobs().await? {
+            let workspace = self.store.workspace(job.workspace_id).await?;
+            let wrapped = self
+                .rewrap_between(&workspace, job.from_kek_id, job.to_kek_id)
+                .await?;
+            self.store
+                .finish_rewrap_job(job.id, "done", wrapped)
+                .await?;
+            total += wrapped;
         }
-        seen.insert(jti.to_owned(), now);
-        Ok(())
+        Ok(total)
     }
 }
 

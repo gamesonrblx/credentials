@@ -159,6 +159,17 @@ pub struct SessionRow {
     pub scopes: Vec<String>,
     pub expires_at: u64,
     pub revoked_at: Option<u64>,
+    pub token_jti: Option<Uuid>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RewrapJobRow {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub from_kek_id: Uuid,
+    pub to_kek_id: Uuid,
+    pub status: String,
+    pub wrapped_count: u64,
 }
 
 #[async_trait]
@@ -236,6 +247,28 @@ pub trait Store: Send + Sync {
     async fn list_recipients(&self, workspace_id: Uuid) -> Result<Vec<RecipientRow>, ApiError>;
     async fn revoke_recipient(&self, workspace_id: Uuid, id: Uuid, at: u64)
         -> Result<(), ApiError>;
+    async fn revoke_jti(
+        &self,
+        jti: Uuid,
+        workspace_id: Uuid,
+        expires_at: u64,
+    ) -> Result<(), ApiError>;
+    async fn jti_is_revoked(&self, jti: Uuid, now: u64) -> Result<bool, ApiError>;
+    async fn claim_dpop_jti(
+        &self,
+        jti: &str,
+        workspace_id: Uuid,
+        expires_at: u64,
+    ) -> Result<(), ApiError>;
+    async fn purge_dpop(&self, now: u64) -> Result<(), ApiError>;
+    async fn insert_rewrap_job(&self, job: RewrapJobRow) -> Result<(), ApiError>;
+    async fn finish_rewrap_job(
+        &self,
+        id: Uuid,
+        status: &str,
+        wrapped_count: u64,
+    ) -> Result<(), ApiError>;
+    async fn pending_rewrap_jobs(&self) -> Result<Vec<RewrapJobRow>, ApiError>;
 }
 
 #[derive(Clone, Debug)]
@@ -284,6 +317,9 @@ struct State {
     agent_tips: HashMap<(Uuid, Uuid), ([u8; 32], u64)>,
     workspace_keys: HashMap<Uuid, WorkspaceKeyRow>,
     recipients: HashMap<Uuid, RecipientRow>,
+    revoked_jtis: HashMap<Uuid, (Uuid, u64)>,
+    dpop_replay: HashMap<String, (Uuid, u64)>,
+    rewrap_jobs: HashMap<Uuid, RewrapJobRow>,
 }
 
 pub struct MemoryStore {
@@ -572,6 +608,15 @@ impl Store for MemoryStore {
 
     async fn revoke_workspace_sessions(&self, workspace_id: Uuid, at: u64) -> Result<(), ApiError> {
         let mut state = lock(&self.inner);
+        let jtis: Vec<(Uuid, u64)> = state
+            .sessions
+            .values()
+            .filter(|session| session.workspace_id == workspace_id && session.revoked_at.is_none())
+            .filter_map(|session| session.token_jti.map(|jti| (jti, session.expires_at)))
+            .collect();
+        for (jti, expires_at) in jtis {
+            state.revoked_jtis.insert(jti, (workspace_id, expires_at));
+        }
         for session in state.sessions.values_mut() {
             if session.workspace_id == workspace_id && session.revoked_at.is_none() {
                 session.revoked_at = Some(at);
@@ -735,6 +780,79 @@ impl Store for MemoryStore {
         }
         row.revoked_at = Some(at);
         Ok(())
+    }
+
+    async fn revoke_jti(
+        &self,
+        jti: Uuid,
+        workspace_id: Uuid,
+        expires_at: u64,
+    ) -> Result<(), ApiError> {
+        lock(&self.inner)
+            .revoked_jtis
+            .insert(jti, (workspace_id, expires_at));
+        Ok(())
+    }
+
+    async fn jti_is_revoked(&self, jti: Uuid, now: u64) -> Result<bool, ApiError> {
+        let state = lock(&self.inner);
+        Ok(state
+            .revoked_jtis
+            .get(&jti)
+            .is_some_and(|(_, expires)| *expires > now))
+    }
+
+    async fn claim_dpop_jti(
+        &self,
+        jti: &str,
+        workspace_id: Uuid,
+        expires_at: u64,
+    ) -> Result<(), ApiError> {
+        let mut state = lock(&self.inner);
+        state
+            .dpop_replay
+            .retain(|_, (_, exp)| *exp > expires_at.saturating_sub(900));
+        if state.dpop_replay.contains_key(jti) {
+            return Err(ApiError::Unauthenticated);
+        }
+        state
+            .dpop_replay
+            .insert(jti.to_owned(), (workspace_id, expires_at));
+        Ok(())
+    }
+
+    async fn purge_dpop(&self, now: u64) -> Result<(), ApiError> {
+        lock(&self.inner)
+            .dpop_replay
+            .retain(|_, (_, exp)| *exp > now);
+        Ok(())
+    }
+
+    async fn insert_rewrap_job(&self, job: RewrapJobRow) -> Result<(), ApiError> {
+        lock(&self.inner).rewrap_jobs.insert(job.id, job);
+        Ok(())
+    }
+
+    async fn finish_rewrap_job(
+        &self,
+        id: Uuid,
+        status: &str,
+        wrapped_count: u64,
+    ) -> Result<(), ApiError> {
+        let mut state = lock(&self.inner);
+        let job = state.rewrap_jobs.get_mut(&id).ok_or(ApiError::NotFound)?;
+        job.status = status.to_owned();
+        job.wrapped_count = wrapped_count;
+        Ok(())
+    }
+
+    async fn pending_rewrap_jobs(&self) -> Result<Vec<RewrapJobRow>, ApiError> {
+        Ok(lock(&self.inner)
+            .rewrap_jobs
+            .values()
+            .filter(|job| job.status == "pending")
+            .cloned()
+            .collect())
     }
 }
 

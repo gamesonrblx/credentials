@@ -67,6 +67,12 @@ async fn main() {
             if let Err(err) = poller.poll_shreds().await {
                 tracing::error!(error = %err, "shred poller failed");
             }
+            if let Err(err) = poller.resume_rewrap_jobs().await {
+                tracing::error!(error = %err, "rewrap job failed");
+            }
+            if let Err(err) = poller.purge_dpop().await {
+                tracing::error!(error = %err, "dpop purge failed");
+            }
         }
     });
 
