@@ -1,6 +1,6 @@
-//! HTTP surface. Proxy injection is the only delivery mode on this listener.
-//! Environment and header delivery stay on the local channel, which this
-//! pre-alpha listener does not expose.
+//! HTTP surface. The public listener serves proxy injection only.
+//! Environment and header delivery require the local Unix socket, which
+//! builds this router with `local_channel` set.
 
 use std::sync::Arc;
 
@@ -22,6 +22,8 @@ pub struct AppState {
     pub gateway: Arc<Gateway>,
     /// When set, `POST /v1/workspaces` requires this bearer. Loopback dev leaves it empty.
     pub operator_token: Option<String>,
+    /// True only on the local Unix socket. The public listener leaves this false.
+    pub local_channel: bool,
 }
 
 pub fn router(gateway: Arc<Gateway>) -> Router {
@@ -29,6 +31,23 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
 }
 
 pub fn router_with_bootstrap(gateway: Arc<Gateway>, operator_token: Option<String>) -> Router {
+    routes().with_state(AppState {
+        gateway,
+        operator_token,
+        local_channel: false,
+    })
+}
+
+/// Same routes as the public listener, with env and header delivery enabled.
+pub fn router_local(gateway: Arc<Gateway>) -> Router {
+    routes().with_state(AppState {
+        gateway,
+        operator_token: None,
+        local_channel: true,
+    })
+}
+
+fn routes() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/workspaces", post(create_workspace))
@@ -45,10 +64,6 @@ pub fn router_with_bootstrap(gateway: Arc<Gateway>, operator_token: Option<Strin
         .route("/v1/kek/rotate", post(rotate_kek))
         .route("/v1/workspaces/{id}/deletion", post(delete_workspace))
         .route("/v1/workspaces/{id}/deletion/cancel", post(cancel_deletion))
-        .with_state(AppState {
-            gateway,
-            operator_token,
-        })
 }
 
 async fn health() -> StatusCode {
@@ -344,7 +359,7 @@ async fn inject(
             },
             htm: "POST".into(),
             htu,
-            local_channel: false,
+            local_channel: state.local_channel,
         })
         .await?;
     Ok(Json(InjectHttpResponse {

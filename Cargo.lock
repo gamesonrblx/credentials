@@ -452,6 +452,7 @@ dependencies = [
  "credentials-crypto",
  "ed25519-dalek",
  "libsqlite3-sys",
+ "nix",
  "rcgen",
  "reqwest",
  "rustls",
@@ -1408,6 +1409,18 @@ dependencies = [
  "hybrid-array",
  "num-traits",
  "zeroize",
+]
+
+[[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]

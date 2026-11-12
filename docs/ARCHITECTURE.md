@@ -416,7 +416,7 @@ The points below are easy to miss if a reader treats [ENCRYPTION.md](ENCRYPTION.
 - `SealedSecret` has no `wrap_mode` and no `e2e_encapsulation`. Writers cannot yet store an end-to-end row, and the running store has nowhere to put one.
 - DPoP `htu` is taken from a request header, as section 5 describes. Per-token `jti` revocation is specified and not built. A disabled agent, a failed DPoP proof, or a replayed DPoP `jti` returns 401 without an audit row. `secret.access.delivered` and `secret.access.failed` ignore an append error. The allow event does not.
 - Workspace delete does not revoke sessions, delete secret rows, or set `shredded`. KEK rotation runs inside the request. There is no rewrap-job table.
-- The public listener refuses env and header. Inside `Gateway::inject`, header delivery still forwards through `Upstream`, and the env branch returns the raw plaintext bytes rather than the `{ env_name, value }` object in the spec. The local channel itself is not built. **Planned (M2)**.
+- The public listener refuses env and header. The local socket (`CREDENTIALS_LOCAL_DIR`, mode `0700`, same-uid peer check) returns `{ env_name, value }` or `{ header_name, value }` and does not forward header delivery through `Upstream`.
 - There is no cloud KMS, no HSM, no public TLS listener, no WebAuthn, and no device or recovery-kit enrollment. Durable storage and a dev audit anchor are in the tree. The hosted anchor is not.
 
 ## 10. Related documents

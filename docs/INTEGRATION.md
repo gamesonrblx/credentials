@@ -16,7 +16,7 @@ On a loopback dev listener, `POST /v1/workspaces` is open so a local process can
 
 The runner calls `POST /v1/inject` with the agent token and a DPoP proof. Use `proxy` delivery for API keys. The gateway calls the allow-listed HTTPS host, sets the policy header, and returns the upstream response. The secret is not in that response.
 
-`env` and `header` are refused on the public listener. They belong on a local channel for a runner on the same machine.
+`env` and `header` are refused on the public listener. They belong on the local socket for a runner on the same machine. Set `CREDENTIALS_LOCAL_DIR` to a directory the gateway owns. It listens on `credentials.sock` inside that directory (directory mode `0700`, socket mode `0600`) and drops connections from any other uid. The decoded inject body is `{ "env_name", "value" }` or `{ "header_name", "value" }`. Header delivery does not forward the request.
 
 ## What this build does not do
 

@@ -18,6 +18,10 @@ mod b64;
 mod dpop;
 mod error;
 mod http;
+#[cfg(unix)]
+mod local;
+#[cfg(test)]
+mod log_canary;
 mod names;
 mod policy;
 mod redact;
@@ -30,7 +34,9 @@ mod upstream;
 pub use anchor::{checkpoint_message, AuditAnchor, DevFileAnchor, MemoryAnchor};
 pub use audit::{verify_chain, AuditRecord};
 pub use error::ApiError;
-pub use http::{router, router_with_bootstrap};
+pub use http::{router, router_local, router_with_bootstrap};
+#[cfg(unix)]
+pub use local::{peer_uid_allowed, serve_local};
 pub use policy::{Delivery, DeliveryPolicy};
 pub use redact::redact_field;
 pub use service::{

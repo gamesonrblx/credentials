@@ -127,6 +127,24 @@ async fn main() {
         }
     });
 
+    if let Ok(directory) = std::env::var("CREDENTIALS_LOCAL_DIR") {
+        #[cfg(unix)]
+        {
+            let local = Arc::clone(&gateway);
+            tokio::spawn(async move {
+                if let Err(err) = credentials_gateway::serve_local(local, directory.into()).await {
+                    tracing::error!(error = %err, "local channel stopped");
+                }
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = directory;
+            eprintln!("CREDENTIALS_LOCAL_DIR is only supported on unix");
+            std::process::exit(1);
+        }
+    }
+
     if let Err(err) = serve_with(gateway, addr, operator_token).await {
         eprintln!("server: {err}");
         std::process::exit(1);

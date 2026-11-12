@@ -18,6 +18,8 @@ Admin routes use `Authorization: Bearer <workspace credential>`. Inject uses the
 
 `proxy` is the delivery mode on the public listener. The gateway calls an `https` URL, sets the policy header itself, does not follow redirects, and does not copy that header back. `env` and `header` are refused on this listener.
 
+A process on the same machine can set `CREDENTIALS_LOCAL_DIR`. The gateway creates that directory mode `0700` and listens on `credentials.sock` mode `0600`. It accepts a connection only when the peer uid matches the gateway uid. That socket speaks the same routes. `env` returns a body whose decoded bytes are `{ "env_name", "value" }`. `header` returns `{ "header_name", "value" }` and does not call the upstream. The HTTP `body` field is standard base64 of those bytes, same as a proxy response.
+
 ## Routes
 
 | Method | Path | Auth |

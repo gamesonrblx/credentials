@@ -643,7 +643,7 @@ impl Gateway {
             .await?;
             return Err(ApiError::Forbidden);
         }
-        let host = if matches!(request.delivery, Delivery::Proxy | Delivery::Header) {
+        let host = if matches!(request.delivery, Delivery::Proxy) {
             let host = https_host(&request.url).ok_or(ApiError::Forbidden)?;
             if !host_allowed(&secret.policy.hosts, &host) {
                 self.audit_or_fail(
@@ -722,7 +722,7 @@ impl Gateway {
         };
 
         let response = match request.delivery {
-            Delivery::Proxy | Delivery::Header => {
+            Delivery::Proxy => {
                 let header_name = secret
                     .policy
                     .header_name
@@ -743,10 +743,38 @@ impl Gateway {
                     })
                     .await
             }
-            Delivery::Env => Ok(crate::upstream::Inbound {
-                status: 200,
-                body: plaintext.to_vec(),
-            }),
+            Delivery::Header => {
+                let header_name = secret
+                    .policy
+                    .header_name
+                    .clone()
+                    .ok_or(ApiError::Forbidden)?;
+                let value = format_header(
+                    secret.policy.header_format.as_deref().unwrap_or(""),
+                    plaintext.as_slice(),
+                )
+                .ok_or(ApiError::Forbidden)?;
+                let body = serde_json::json!({ "header_name": header_name, "value": value });
+                Ok(crate::upstream::Inbound {
+                    status: 200,
+                    body: serde_json::to_vec(&body).unwrap_or_default(),
+                })
+            }
+            Delivery::Env => {
+                let env_name = secret
+                    .policy
+                    .env_name
+                    .clone()
+                    .filter(|name| !name.is_empty())
+                    .ok_or(ApiError::Forbidden)?;
+                let value = std::str::from_utf8(plaintext.as_slice())
+                    .map_err(|_| ApiError::DecryptFailed)?;
+                let body = serde_json::json!({ "env_name": env_name, "value": value });
+                Ok(crate::upstream::Inbound {
+                    status: 200,
+                    body: serde_json::to_vec(&body).unwrap_or_default(),
+                })
+            }
         };
         let response = match response {
             Ok(response) => response,

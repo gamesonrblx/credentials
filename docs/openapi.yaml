@@ -96,7 +96,7 @@ paths:
         - agentToken: []
       responses:
         "200":
-          description: Upstream status and body for proxy delivery.
+          description: Upstream status and base64 body. Proxy is the public-listener mode. On the local socket, env and header return base64 of {env_name,value} or {header_name,value}. The public listener refuses those modes.
         "503":
           description: Audit append failed, the anchor lagged, or the KMS is down.
   /v1/audit:

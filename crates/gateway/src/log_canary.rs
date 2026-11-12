@@ -1,0 +1,103 @@
+//! Spec item 14: a known canary must not reach the log sink.
+
+use std::sync::{Mutex, Once};
+
+use tracing::field::Visit;
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::Layer;
+
+use crate::service::{Clock, Gateway};
+use crate::store::MemoryStore;
+use crate::DeliveryPolicy;
+use crate::RecordingUpstream;
+use credentials_crypto::{DevPolicy, MemoryRootKeys};
+
+static START: Once = Once::new();
+static SINK: Mutex<String> = Mutex::new(String::new());
+
+struct Capture;
+
+struct Fields(String);
+
+impl Visit for Fields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        let _ = write!(self.0, " {}={value:?}", field.name());
+    }
+}
+
+impl<S> Layer<S> for Capture
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let mut fields = Fields(String::new());
+        event.record(&mut fields);
+        let line = format!(
+            "{} {}{}\n",
+            event.metadata().target(),
+            event.metadata().name(),
+            fields.0
+        );
+        SINK.lock().expect("log sink").push_str(&line);
+    }
+}
+
+fn install() {
+    START.call_once(|| {
+        let subscriber = tracing_subscriber::registry().with(Capture);
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+}
+
+#[tokio::test]
+async fn canary_stays_out_of_the_log_sink() {
+    install();
+    SINK.lock().expect("log sink").clear();
+    let canary = "canary-7c1e0b9a4d22";
+    let gateway = Gateway::new(
+        std::sync::Arc::new(MemoryStore::new()),
+        std::sync::Arc::new(MemoryRootKeys::new(DevPolicy { allow_dev: true }).unwrap()),
+        std::sync::Arc::new(RecordingUpstream::new()),
+        std::sync::Arc::new(Clock),
+    )
+    .unwrap();
+    let created = gateway.create_workspace().await.unwrap();
+    gateway
+        .create_secret(
+            &created.credential,
+            "prod/openai/api_key",
+            canary.as_bytes(),
+            DeliveryPolicy {
+                header_name: Some("Authorization".into()),
+                header_format: Some("Bearer {value}".into()),
+                env_name: None,
+                hosts: vec!["api.openai.com".into()],
+                allow_proxy: true,
+                allow_header: false,
+                allow_env: false,
+            },
+        )
+        .await
+        .unwrap();
+    let rejected = gateway
+        .inject(crate::InjectRequest {
+            token: canary.into(),
+            dpop: canary.into(),
+            secret: "prod/openai/api_key".into(),
+            delivery: crate::Delivery::Proxy,
+            method: "POST".into(),
+            url: "https://api.openai.com/v1/chat/completions".into(),
+            body: Vec::new(),
+            htm: "POST".into(),
+            htu: "https://credentials.local/v1/inject".into(),
+            local_channel: false,
+        })
+        .await;
+    assert!(rejected.is_err());
+    let sink = SINK.lock().expect("log sink").clone();
+    assert!(
+        !sink.contains(canary),
+        "canary reached the log sink: {sink}"
+    );
+}
