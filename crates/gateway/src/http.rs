@@ -20,9 +20,15 @@ use crate::ApiError;
 #[derive(Clone)]
 pub struct AppState {
     pub gateway: Arc<Gateway>,
+    /// When set, `POST /v1/workspaces` requires this bearer. Loopback dev leaves it empty.
+    pub operator_token: Option<String>,
 }
 
 pub fn router(gateway: Arc<Gateway>) -> Router {
+    router_with_bootstrap(gateway, None)
+}
+
+pub fn router_with_bootstrap(gateway: Arc<Gateway>, operator_token: Option<String>) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/workspaces", post(create_workspace))
@@ -39,7 +45,10 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route("/v1/kek/rotate", post(rotate_kek))
         .route("/v1/workspaces/{id}/deletion", post(delete_workspace))
         .route("/v1/workspaces/{id}/deletion/cancel", post(cancel_deletion))
-        .with_state(AppState { gateway })
+        .with_state(AppState {
+            gateway,
+            operator_token,
+        })
 }
 
 async fn health() -> StatusCode {
@@ -54,7 +63,19 @@ struct WorkspaceResponse {
 
 async fn create_workspace(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<WorkspaceResponse>, ApiError> {
+    if let Some(expected) = &state.operator_token {
+        let presented = bearer(&headers).unwrap_or("");
+        if presented.len() != expected.len()
+            || !bool::from(subtle::ConstantTimeEq::ct_eq(
+                presented.as_bytes(),
+                expected.as_bytes(),
+            ))
+        {
+            return Err(ApiError::Unauthenticated);
+        }
+    }
     let created: CreatedWorkspace = state.gateway.create_workspace().await?;
     Ok(Json(WorkspaceResponse {
         id: created.id,

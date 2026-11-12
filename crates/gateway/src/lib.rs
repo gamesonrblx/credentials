@@ -30,7 +30,7 @@ mod upstream;
 pub use anchor::{checkpoint_message, AuditAnchor, DevFileAnchor, MemoryAnchor};
 pub use audit::{verify_chain, AuditRecord};
 pub use error::ApiError;
-pub use http::router;
+pub use http::{router, router_with_bootstrap};
 pub use policy::{Delivery, DeliveryPolicy};
 pub use redact::redact_field;
 pub use service::{
@@ -47,9 +47,17 @@ use std::sync::Arc;
 
 /// Bind the dev server. The listener address defaults to loopback.
 pub async fn serve(gateway: Arc<Gateway>, addr: SocketAddr) -> std::io::Result<()> {
+    serve_with(gateway, addr, None).await
+}
+
+pub async fn serve_with(
+    gateway: Arc<Gateway>,
+    addr: SocketAddr,
+    operator_token: Option<String>,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "credentials gateway listening");
-    axum::serve(listener, router(gateway)).await
+    axum::serve(listener, router_with_bootstrap(gateway, operator_token)).await
 }
 
 /// Bind an ephemeral loopback port and serve in the background.

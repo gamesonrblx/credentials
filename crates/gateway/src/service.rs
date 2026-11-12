@@ -105,6 +105,8 @@ pub struct Gateway {
     upstream: Arc<dyn Upstream>,
     anchor: Arc<dyn AuditAnchor>,
     signer: DevSigner,
+    issuer: String,
+    audience: String,
     clock: Arc<dyn Now>,
     kek_cache: Mutex<HashMap<Uuid, CachedKek>>,
     kek_flight: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
@@ -203,6 +205,8 @@ impl Gateway {
             upstream,
             anchor,
             signer,
+            issuer: ISSUER.to_owned(),
+            audience: crate::token::AUDIENCE.to_owned(),
             clock,
             kek_cache: Mutex::new(HashMap::new()),
             kek_flight: Mutex::new(HashMap::new()),
@@ -215,6 +219,18 @@ impl Gateway {
             }),
             metrics_integrity: AtomicU64::new(0),
         })
+    }
+
+    pub fn set_issuer(&mut self, issuer: impl Into<String>) {
+        self.issuer = issuer.into();
+    }
+
+    pub fn set_audience(&mut self, audience: impl Into<String>) {
+        self.audience = audience.into();
+    }
+
+    pub fn issuer(&self) -> &str {
+        &self.issuer
     }
 
     pub fn set_anchor_max_lag(&self, secs: u64) {
@@ -489,7 +505,7 @@ impl Gateway {
             scopes,
             jkt,
         };
-        let token = self.signer.sign(ISSUER, &claims)?;
+        let token = self.signer.sign(&self.issuer, &self.audience, &claims)?;
         self.store
             .append_audit(self.audit(
                 workspace.id,
@@ -528,9 +544,12 @@ impl Gateway {
     }
 
     pub async fn inject(&self, request: InjectRequest) -> Result<InjectResponse, ApiError> {
-        let claims = self
-            .signer
-            .verify(&request.token, ISSUER, self.clock.unix_secs())?;
+        let claims = self.signer.verify(
+            &request.token,
+            &self.issuer,
+            &self.audience,
+            self.clock.unix_secs(),
+        )?;
         let workspace = self.store.workspace(claims.workspace_id).await?;
         if workspace.status != "active" {
             self.audit_or_fail(

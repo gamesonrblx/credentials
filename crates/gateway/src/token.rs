@@ -149,7 +149,7 @@ impl DevSigner {
             .is_ok()
     }
 
-    pub fn sign(&self, iss: &str, claims: &AgentClaims) -> Result<String, ApiError> {
+    pub fn sign(&self, iss: &str, aud: &str, claims: &AgentClaims) -> Result<String, ApiError> {
         if claims.exp <= claims.iat || claims.exp - claims.iat > MAX_TTL_SECS {
             return Err(ApiError::BadRequest);
         }
@@ -159,7 +159,7 @@ impl DevSigner {
         );
         let wire = WireClaims {
             iss: iss.to_owned(),
-            aud: AUDIENCE.to_owned(),
+            aud: aud.to_owned(),
             sub: format!("agent:{}", claims.agent_id),
             iat: claims.iat,
             nbf: claims.iat,
@@ -186,7 +186,13 @@ impl DevSigner {
         ))
     }
 
-    pub fn verify(&self, token: &str, iss: &str, now: u64) -> Result<AgentClaims, ApiError> {
+    pub fn verify(
+        &self,
+        token: &str,
+        iss: &str,
+        aud: &str,
+        now: u64,
+    ) -> Result<AgentClaims, ApiError> {
         let (header_b64, payload_b64, sig_b64) = split_jwt(token)?;
         let header: serde_json::Value = serde_json::from_slice(&b64url_decode(header_b64)?)
             .map_err(|_| ApiError::Unauthenticated)?;
@@ -209,7 +215,7 @@ impl DevSigner {
             .map_err(|_| ApiError::Unauthenticated)?;
         let wire: WireClaims = serde_json::from_slice(&b64url_decode(payload_b64)?)
             .map_err(|_| ApiError::Unauthenticated)?;
-        if wire.iss != iss || wire.aud != AUDIENCE {
+        if wire.iss != iss || wire.aud != aud {
             return Err(ApiError::Unauthenticated);
         }
         if wire.exp <= wire.iat || wire.exp - wire.iat > MAX_TTL_SECS {
@@ -297,9 +303,12 @@ mod tests {
             jkt: "thumb".into(),
         };
         let iss = "https://credentials.local/v1";
-        let token = signer.sign(iss, &claims).unwrap();
-        assert!(signer.verify(&token, iss, 100).is_ok());
-        assert!(signer.verify(&token, iss, 10_000).is_err());
-        assert!(signer.verify(&token, "https://other", 100).is_err());
+        let token = signer.sign(iss, AUDIENCE, &claims).unwrap();
+        assert!(signer.verify(&token, iss, AUDIENCE, 100).is_ok());
+        assert!(signer.verify(&token, iss, AUDIENCE, 10_000).is_err());
+        assert!(signer
+            .verify(&token, "https://other", AUDIENCE, 100)
+            .is_err());
+        assert!(signer.verify(&token, iss, "other-aud", 100).is_err());
     }
 }

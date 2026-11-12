@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use credentials_crypto::{DevFileRootKeys, DevPolicy};
 use credentials_gateway::{
-    serve, Clock, DevFileAnchor, DevSigner, Gateway, HttpUpstream, SqlStore,
+    serve_with, Clock, DevFileAnchor, DevSigner, Gateway, HttpUpstream, SqlStore,
 };
 
 #[tokio::main]
@@ -75,7 +75,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let gateway = match Gateway::with_anchor(
+    let mut gateway = match Gateway::with_anchor(
         store,
         kms,
         Arc::new(HttpUpstream::new().unwrap_or_else(|err| {
@@ -86,12 +86,19 @@ async fn main() {
         signer,
         anchor,
     ) {
-        Ok(gateway) => Arc::new(gateway),
+        Ok(gateway) => gateway,
         Err(err) => {
             eprintln!("gateway: {err}");
             std::process::exit(1);
         }
     };
+    if let Ok(issuer) = std::env::var("CREDENTIALS_ISSUER") {
+        gateway.set_issuer(issuer);
+    }
+    if let Ok(audience) = std::env::var("CREDENTIALS_AUDIENCE") {
+        gateway.set_audience(audience);
+    }
+    let gateway = Arc::new(gateway);
 
     let addr: SocketAddr = std::env::var("CREDENTIALS_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:8080".into())
@@ -100,6 +107,11 @@ async fn main() {
             eprintln!("CREDENTIALS_LISTEN is not a socket address");
             std::process::exit(1);
         });
+    let operator_token = std::env::var("CREDENTIALS_OPERATOR_TOKEN").ok();
+    if !addr.ip().is_loopback() && operator_token.is_none() {
+        eprintln!("CREDENTIALS_OPERATOR_TOKEN is required when the listener is not loopback");
+        std::process::exit(1);
+    }
 
     let poller = Arc::clone(&gateway);
     tokio::spawn(async move {
@@ -115,7 +127,7 @@ async fn main() {
         }
     });
 
-    if let Err(err) = serve(gateway, addr).await {
+    if let Err(err) = serve_with(gateway, addr, operator_token).await {
         eprintln!("server: {err}");
         std::process::exit(1);
     }
