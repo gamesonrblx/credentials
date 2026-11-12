@@ -24,6 +24,7 @@ pub fn put_locked(
     secret_key: &str,
 ) -> Result<LockedObject, LockError> {
     let url = format!("{endpoint}/{bucket}/{key}");
+    let (amz_date, date_stamp) = crate::aws_kms::amz_now();
     let auth = authorization(
         "PUT",
         &url,
@@ -32,8 +33,8 @@ pub fn put_locked(
         "s3",
         access_key,
         secret_key,
-        "20130524T000000Z",
-        "20130524",
+        &amz_date,
+        &date_stamp,
     );
     let endpoint = endpoint.to_owned();
     let bucket = bucket.to_owned();
@@ -51,7 +52,7 @@ pub fn put_locked(
                         reqwest::Client::new()
                             .put(format!("{endpoint}/{bucket}/{key_owned}"))
                             .header("Authorization", auth)
-                            .header("x-amz-date", "20130524T000000Z")
+                            .header("x-amz-date", amz_date)
                             .header("x-amz-object-lock-mode", "COMPLIANCE")
                             .header("x-amz-object-lock-retain-until-date", retain_until)
                             .body(body)

@@ -56,6 +56,7 @@ impl AwsKms {
                         .build()
                         .expect("kms runtime")
                         .block_on(async move {
+                            let (amz_date, date_stamp) = amz_now();
                             let auth = authorization(
                                 "POST",
                                 &url,
@@ -64,13 +65,13 @@ impl AwsKms {
                                 "kms",
                                 &access,
                                 &secret,
-                                "20130524T000000Z",
-                                "20130524",
+                                &amz_date,
+                                &date_stamp,
                             );
                             http.post(url)
                                 .header("Content-Type", "application/x-amz-json-1.1")
                                 .header("X-Amz-Target", format!("TrentService.{target}"))
-                                .header("X-Amz-Date", "20130524T000000Z")
+                                .header("X-Amz-Date", amz_date)
                                 .header("Authorization", auth)
                                 .body(payload)
                                 .send()
@@ -272,6 +273,38 @@ pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut result = [0u8; 32];
     result.copy_from_slice(&out);
     result
+}
+
+pub fn amz_now() -> (String, String) {
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (unix / 86_400) as i64;
+    let secs = unix % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let date = format!("{year:04}{month:02}{day:02}");
+    let stamp = format!(
+        "{date}T{:02}{:02}{:02}Z",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    );
+    (stamp, date)
+}
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

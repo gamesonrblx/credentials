@@ -23,6 +23,8 @@ The operator is whoever administers the control plane.
 Tactico is the operator when Tactico hosts the control plane.
 The dev gateway decrypts `wrap_mode=gateway` in process.
 The production control plane uses `RejectingRootKeys` and does not open an e2e secret.
+`revoked_jtis` and `dpop_replay` are durable.
+A restart still rejects a revoked token and a replayed DPoP proof.
 `credentials-injector` opens an e2e secret.
 The sections below say **implemented** or **planned (Mx)** for each piece.
 [ENCRYPTION.md](ENCRYPTION.md) is normative for the envelope, associated data, tokens, and the audit encoding.

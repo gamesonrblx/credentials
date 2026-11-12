@@ -46,20 +46,28 @@ The local socket delivers `env` and `header`.
 That directory mode is `0700`.
 The peer uid must match the process uid.
 There is no live hosted service.
-Default CI does not use S3 Object Lock.
+`inject` reads `revoked_jtis` from the database.
+DPoP replay rows live in `dpop_replay`.
+The poller deletes expired DPoP rows.
+KEK rotation writes a `rewrap_jobs` row.
+The Ubuntu integration job starts LocalStack, MinIO, Vault, Postgres, and Dex.
+That job calls AWS KMS, Object Lock, Vault Transit, and Vault KV.
+Infisical, Doppler, and 1Password tests use recorded HTTP shapes.
+They do not call the paid vendor APIs.
 There is no real Nitro hardware path.
 `credentials-edge` checks a test PCR document.
-That check is not a live enclave.
-The tree has no full `COSE_Sign1` AWS chain verifier.
+That check is not `COSE_Sign1` and not the AWS Nitro certificate chain.
+An EIF build needs Nitro hardware.
 Vault Transit and AWS KMS adapters are in `credentials-edge`.
 A customer process or a dev process can call those adapters.
 `Gateway::control_plane` does not call those adapters.
-`credentials-edge` has a WebAuthn software authenticator.
+A paid AWS account is not required for the LocalStack test.
+`credentials-edge` has a WebAuthn software authenticator for tests.
+It is not the `webauthn-rs` crate.
 `credentials-edge` has OIDC PKCE helpers.
+The static dashboard does not complete a login yet.
 SAML is not implemented.
 The dashboard HTML does not decrypt a secret.
-Import HTTP readers exist for Infisical, Doppler, 1Password Connect, and Vault KV.
-Default CI does not call those live APIs.
 
 ## How to read the milestones
 
