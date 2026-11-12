@@ -41,7 +41,7 @@ cargo run -p credentials-gateway
 
 The dev gateway listens on `127.0.0.1:8080`. Keep that port on the local machine.
 
-Set `CREDENTIALS_ENV=production` to start the control plane that cannot unwrap. That mode requires `CREDENTIALS_SIGNING_KEY`, `CREDENTIALS_AUDIT_ANCHOR`, and `CREDENTIALS_DATABASE_URL`.
+Set `CREDENTIALS_ENV=production` to start the control plane that cannot unwrap. That mode requires `CREDENTIALS_SIGNING_KEY`, `CREDENTIALS_AUDIT_ANCHOR`, `CREDENTIALS_DATABASE_URL`, and `CREDENTIALS_PUBLIC_URL`. It also requires `CREDENTIALS_TLS_CERT` and `CREDENTIALS_TLS_KEY` unless `TLS_REQUIRE_HYBRID` is off. Read [SELF_HOST.md](SELF_HOST.md) for each variable.
 
 The GitHub Actions workflow `.github/workflows/ci.yml` runs format, Clippy, tests, and `cargo deny` on Linux, macOS, and Windows.
 
@@ -73,6 +73,10 @@ Check `revoked_jtis` on every inject request. A revoked `jti` is an authenticati
 
 Bind each DPoP proof to the request method, the request URI, and the access token. Reject a proof `jti` that the store has already claimed.
 
+Sign every end-to-end release. The injector verifies the grant signature before it reads a grant field. It rejects an unsigned grant. Change the grant format in the gateway and in the injector together. `crates/injector/tests/gateway_grant.rs` links both and fails on drift.
+
+Do not return a proxy response that contains the secret. Do not add `TRACE` or `CONNECT` to the method list.
+
 ## Gaps that need hardware or a paid account
 
 A Nitro EIF, a vsock to the hypervisor, and a document that the AWS Nitro root signed need Nitro hardware. CI verifies a COSE_Sign1 ES384 document with a test root.
@@ -93,17 +97,63 @@ Revise [ENCRYPTION.md](ENCRYPTION.md) section 10. That section still draws the d
 
 Dependabot pull request #4 bumps `actions/checkout` from 4 to 7. It is not part of this stack.
 
+## Open items from the security review
+
+Pull request #28 fixed the findings of a full code review. The items below are still open. Do not report them as fixed.
+
+### Review of the fix itself
+
+No person has reviewed pull request #28. Agents wrote it. It changed about 8,400 lines in 72 files. CI passed on Linux, macOS, Windows, Postgres, and the container job. Read the gateway commit first. It changes what production inject returns and how workspace deletion works.
+
+### Left on purpose
+
+The audit chain is an unkeyed hash chain. A writer with database access can rebuild it. Detection rests on the signed checkpoints and on the anchor check that runs once for each workspace in each process. A keyed chain is a format change.
+
+One Ed25519 key signs agent tokens, audit checkpoints, and grants. Each signature has its own prefix. The three uses do not have separate keys. An anchored tip carries no key id, so a signing-key rotation fails the anchor check. Add a key id to the anchor format before you rotate that key.
+
+OIDC login does not verify the identity provider signature on the ID token. It checks the issuer, the audience, the expiry, and the nonce. The token comes from the token endpoint over TLS. Add JWKS verification before you accept an ID token from any other channel.
+
+OIDC discovery is not cached. `/v1/login` allows 16 concurrent identity-provider calls and returns 503 above that.
+
+`unwrap_kek` in the dev gateway makes a synchronous KMS call on an async thread. The production control plane does not reach that code.
+
+The secret-in-response check compares exact bytes. It does not catch a base64 or URL-encoded copy. It skips a value shorter than 8 bytes. An allow-listed host is still inside the trust boundary.
+
+The TLS listener has a handshake timeout and a header timeout. A slow request body after the headers has no timeout.
+
+`Gateway::audit_log` still loads and verifies the whole chain. The HTTP route no longer calls it. Do not put it back on a request path.
+
+`credentials-edge` holds adapters for AWS KMS, Vault Transit, S3 Object Lock, the import readers, WebAuthn, and Nitro attestation. Only OIDC is wired into the gateway. The other adapters run only in tests. The S3 adapter does not send a session token.
+
+Nitro verification does not check revocation, key usage, or unknown critical extensions.
+
+### Not verified
+
+No one has run `docker compose up` with the new `compose.yaml` and `Dockerfile`. CI does not build the image. Check that the named volume is writable by uid 10001 and that the health check passes.
+
+No real AWS Nitro document has gone through `verify_attestation`. The tests build the chain with a test root.
+
+No test makes a real HTTPS call through `HttpUpstream::new` or through the injector `ReqwestTransport`. The tests use a local server or a recorder.
+
+No test covers `serve_tls` from end to end. The accept retry, the timeouts, and the connection limit have no test. The 503 paths of the login handlers have no test.
+
+Dex is the only identity provider that the login has run against.
+
+### Repository settings
+
+The `main` branch has no branch protection. Require the CI checks and one review before a merge.
+
 ## Defaults
 
-An unset `CREDENTIALS_ENV` starts the dev gateway. The dev gateway can open a `wrap_mode=gateway` row.
+An unset `CREDENTIALS_ENV` starts the dev gateway. The dev gateway can open a `wrap_mode=gateway` row. The process exits on a value other than `production`, `prod`, `development`, `dev`, or `test`.
 
-`CREDENTIALS_LISTEN` defaults to `127.0.0.1:8080`. A listener that is not loopback requires `CREDENTIALS_OPERATOR_TOKEN`.
+`CREDENTIALS_LISTEN` defaults to `127.0.0.1:8080`. A listener that is not loopback requires `CREDENTIALS_OPERATOR_TOKEN` with at least 16 characters.
 
 `TLS_REQUIRE_HYBRID` is on when `CREDENTIALS_ENV=production` and the variable is unset. The listener then offers only group 4588, `X25519MLKEM768`.
 
 The dev key file is `.credentials-dev-keys.json`. The dev signer file is `.credentials-dev-signer.json`. The default database is a SQLite file beside the process.
 
-OIDC login uses client id `credentials` when `CREDENTIALS_OIDC_CLIENT_ID` is unset. The redirect defaults to `http://<listen>/v1/login/callback`.
+OIDC login uses client id `credentials` when `CREDENTIALS_OIDC_CLIENT_ID` is unset. The redirect defaults to `<CREDENTIALS_PUBLIC_URL>/v1/login/callback`. Without that variable it uses the listen address.
 
 The dashboard session cookie is not an inject credential. The OAuth `state` is not the PKCE verifier.
 
