@@ -1,0 +1,37 @@
+# Local self-host example. The database password is for this example only.
+# The gateway container has no decapsulation key. The injector is a second
+# service with its own volume. Postgres is reached without TLS because this
+# client build does not speak Postgres TLS. Do not publish that port.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: credentials
+      POSTGRES_PASSWORD: credentials
+      POSTGRES_DB: credentials
+  gateway:
+    build: .
+    environment:
+      CREDENTIALS_ENV: production
+      CREDENTIALS_DATABASE_URL: postgres://credentials:credentials@db:5432/credentials?sslmode=disable
+      CREDENTIALS_SIGNING_KEY: /var/credentials/signing.json
+      CREDENTIALS_AUDIT_ANCHOR: /var/credentials/anchor.log
+      CREDENTIALS_OPERATOR_TOKEN: change-me
+      CREDENTIALS_LISTEN: 0.0.0.0:8080
+    volumes:
+      - gateway-data:/var/credentials
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+  injector:
+    build: .
+    entrypoint: ["credentials-injector"]
+    volumes:
+      - injector-keys:/var/injector
+    profiles: ["injector"]
+
+volumes:
+  gateway-data:
+  injector-keys:

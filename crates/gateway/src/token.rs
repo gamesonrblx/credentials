@@ -72,6 +72,39 @@ impl DevSigner {
         Ok(Self::from_seed(kid, seed.as_slice()))
     }
 
+    /// Signing seed for the production control plane. Refused in dev, and
+    /// refused if the file is a dev signer seed. This key signs tokens and
+    /// audit tips. It does not unwrap secrets.
+    pub fn load_production(path: &Path, policy: DevPolicy) -> Result<Self, ApiError> {
+        if policy.allow_dev {
+            return Err(ApiError::KmsUnavailable);
+        }
+        if path.exists() {
+            let bytes = fs::read(path).map_err(|_| ApiError::KmsUnavailable)?;
+            let file: SignerFile =
+                serde_json::from_slice(&bytes).map_err(|_| ApiError::KmsUnavailable)?;
+            if file.warning.contains("DEV ONLY") {
+                return Err(ApiError::KmsUnavailable);
+            }
+            let seed =
+                Zeroizing::new(hex_decode(&file.seed_hex).map_err(|_| ApiError::KmsUnavailable)?);
+            if seed.len() != 32 {
+                return Err(ApiError::KmsUnavailable);
+            }
+            return Ok(Self::from_seed(file.kid, seed.as_slice()));
+        }
+        let signer = Self::generate("sign-1")?;
+        let seed = signer.signing.to_bytes();
+        let file = SignerFile {
+            warning: "Signing seed for tokens and audit tips. Not a secret-unwrapping key."
+                .to_owned(),
+            kid: signer.kid.clone(),
+            seed_hex: hex_encode(&seed),
+        };
+        Self::write_seed(path, &file)?;
+        Ok(signer)
+    }
+
     /// Dev signing seed on disk. Refused when `CREDENTIALS_ENV=production`.
     /// The database must not hold this seed.
     pub fn load_or_create(path: &Path, policy: DevPolicy) -> Result<Self, ApiError> {
@@ -102,7 +135,30 @@ impl DevSigner {
             kid: signer.kid.clone(),
             seed_hex: hex_encode(&seed),
         };
-        let bytes = serde_json::to_vec_pretty(&file).map_err(|_| ApiError::KmsUnavailable)?;
+        Self::write_seed(path, &file)?;
+        Ok(signer)
+    }
+
+    fn from_seed(kid: impl Into<String>, seed: &[u8]) -> Self {
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(&seed[..32]);
+        Self {
+            kid: kid.into(),
+            signing: SigningKey::from_bytes(&raw),
+        }
+    }
+
+    pub fn sign_message(&self, message: &[u8]) -> Vec<u8> {
+        self.signing.sign(message).to_bytes().to_vec()
+    }
+
+    fn write_seed(path: &Path, file: &SignerFile) -> Result<(), ApiError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|_| ApiError::KmsUnavailable)?;
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(file).map_err(|_| ApiError::KmsUnavailable)?;
         let tmp = path.with_extension("tmp");
         {
             let mut options = OpenOptions::new();
@@ -123,20 +179,7 @@ impl DevSigner {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
         }
-        Ok(signer)
-    }
-
-    fn from_seed(kid: impl Into<String>, seed: &[u8]) -> Self {
-        let mut raw = [0u8; 32];
-        raw.copy_from_slice(&seed[..32]);
-        Self {
-            kid: kid.into(),
-            signing: SigningKey::from_bytes(&raw),
-        }
-    }
-
-    pub fn sign_message(&self, message: &[u8]) -> Vec<u8> {
-        self.signing.sign(message).to_bytes().to_vec()
+        Ok(())
     }
 
     pub fn verify_message(&self, message: &[u8], signature: &[u8]) -> bool {

@@ -115,6 +115,7 @@ pub struct Gateway {
     dpop_seen: Mutex<HashMap<String, u64>>,
     anchor_track: Mutex<AnchorTrack>,
     pub metrics_integrity: AtomicU64,
+    unwrap_secrets: bool,
 }
 
 pub struct CreatedWorkspace {
@@ -233,6 +234,45 @@ impl Gateway {
                 max_lag: AUDIT_ANCHOR_MAX_LAG,
             }),
             metrics_integrity: AtomicU64::new(0),
+            unwrap_secrets: true,
+        })
+    }
+
+    /// Production control plane. It does not take a provider that can unwrap
+    /// secret keys. `policy` must be production. Gateway-wrapped rows fail
+    /// closed. End-to-end rows are released as ciphertext.
+    pub fn control_plane(
+        store: Arc<dyn Store>,
+        upstream: Arc<dyn Upstream>,
+        clock: Arc<dyn Now>,
+        signer: DevSigner,
+        anchor: Arc<dyn AuditAnchor>,
+        policy: DevPolicy,
+    ) -> Result<Self, ApiError> {
+        if policy.allow_dev {
+            return Err(ApiError::KmsUnavailable);
+        }
+        let started_at = clock.unix_secs();
+        Ok(Self {
+            store,
+            kms: Arc::new(credentials_crypto::RejectingRootKeys),
+            upstream,
+            anchor,
+            signer,
+            issuer: ISSUER.to_owned(),
+            audience: crate::token::AUDIENCE.to_owned(),
+            clock,
+            kek_cache: Mutex::new(HashMap::new()),
+            kek_flight: Mutex::new(HashMap::new()),
+            dpop_seen: Mutex::new(HashMap::new()),
+            anchor_track: Mutex::new(AnchorTrack {
+                started_at,
+                last_checkpoint_at: HashMap::new(),
+                failed_since: None,
+                max_lag: AUDIT_ANCHOR_MAX_LAG,
+            }),
+            metrics_integrity: AtomicU64::new(0),
+            unwrap_secrets: false,
         })
     }
 
@@ -254,18 +294,23 @@ impl Gateway {
 
     pub async fn create_workspace(&self) -> Result<CreatedWorkspace, ApiError> {
         let id = Uuid::now_v7();
-        let key_ref = self.kms.create_tenant_root(id).map_err(map_crypto)?;
         let kek_id = Uuid::now_v7();
-        let kek = ZeroizingBuf::new(random_32()?);
-        let context = KekContext {
-            workspace_id: id,
-            kek_id,
-            kek_version: 1,
+        let (key_ref, wrapped) = if self.unwrap_secrets {
+            let key_ref = self.kms.create_tenant_root(id).map_err(map_crypto)?;
+            let kek = ZeroizingBuf::new(random_32()?);
+            let context = KekContext {
+                workspace_id: id,
+                kek_id,
+                kek_version: 1,
+            };
+            let wrapped = self
+                .kms
+                .encrypt(&key_ref, kek.as_slice(), &context)
+                .map_err(map_crypto)?;
+            (key_ref, wrapped)
+        } else {
+            ("control-plane".to_owned(), Vec::new())
         };
-        let wrapped = self
-            .kms
-            .encrypt(&key_ref, kek.as_slice(), &context)
-            .map_err(map_crypto)?;
         let credential = ZeroizingBuf::new(random_32()?);
         let hash = sha256(credential.as_slice());
         self.store

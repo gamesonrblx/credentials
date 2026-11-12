@@ -110,16 +110,14 @@ impl AuditAnchor for MemoryAnchor {
     }
 }
 
-/// Append-only local file. Not a retention-locked object store.
-pub struct DevFileAnchor {
+/// Append-only local file. Allowed in production. Not a retention-locked
+/// object store, and not the dev anchor.
+pub struct FileAnchor {
     path: PathBuf,
 }
 
-impl DevFileAnchor {
-    pub fn open(path: impl Into<PathBuf>, policy: DevPolicy) -> Result<Self, ApiError> {
-        if !policy.allow_dev {
-            return Err(ApiError::KmsUnavailable);
-        }
+impl FileAnchor {
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, ApiError> {
         let path = path.into();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -133,8 +131,24 @@ impl DevFileAnchor {
     }
 }
 
+/// Dev file anchor. Refused when `CREDENTIALS_ENV=production`.
+pub struct DevFileAnchor {
+    inner: FileAnchor,
+}
+
+impl DevFileAnchor {
+    pub fn open(path: impl Into<PathBuf>, policy: DevPolicy) -> Result<Self, ApiError> {
+        if !policy.allow_dev {
+            return Err(ApiError::KmsUnavailable);
+        }
+        Ok(Self {
+            inner: FileAnchor::open(path)?,
+        })
+    }
+}
+
 #[async_trait]
-impl AuditAnchor for DevFileAnchor {
+impl AuditAnchor for FileAnchor {
     async fn put(
         &self,
         workspace_id: Uuid,
@@ -175,6 +189,23 @@ impl AuditAnchor for DevFileAnchor {
             });
         }
         Ok(found)
+    }
+}
+
+#[async_trait]
+impl AuditAnchor for DevFileAnchor {
+    async fn put(
+        &self,
+        workspace_id: Uuid,
+        seq: u64,
+        tip_hash: &[u8; 32],
+        signature: &[u8],
+    ) -> Result<(), ApiError> {
+        self.inner.put(workspace_id, seq, tip_hash, signature).await
+    }
+
+    async fn latest(&self, workspace_id: Uuid) -> Result<Option<AnchoredTip>, ApiError> {
+        self.inner.latest(workspace_id).await
     }
 }
 

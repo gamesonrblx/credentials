@@ -31,7 +31,7 @@ mod store;
 mod token;
 mod upstream;
 
-pub use anchor::{checkpoint_message, AuditAnchor, DevFileAnchor, MemoryAnchor};
+pub use anchor::{checkpoint_message, AuditAnchor, DevFileAnchor, FileAnchor, MemoryAnchor};
 pub use audit::{verify_chain, AuditRecord};
 pub use error::ApiError;
 pub use http::{router, router_local, router_with_bootstrap};

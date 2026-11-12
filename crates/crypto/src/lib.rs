@@ -38,8 +38,8 @@ pub use hybrid::{
     HybridKeyPair, HybridWrapped,
 };
 pub use kms::{
-    CountingProvider, DevFileRootKeys, DevPolicy, KekContext, MemoryRootKeys, RootKeyProvider,
-    RootKeyState,
+    CountingProvider, DevFileRootKeys, DevPolicy, KekContext, MemoryRootKeys, RejectingRootKeys,
+    RootKeyProvider, RootKeyState,
 };
 pub use random::random_bytes;
 pub use recovery::{

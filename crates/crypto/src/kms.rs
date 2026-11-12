@@ -347,6 +347,56 @@ impl RootKeyProvider for DevFileRootKeys {
     }
 }
 
+/// A root-key provider that cannot wrap or unwrap anything.
+///
+/// The production control plane uses this so a configuration mistake cannot
+/// become a decrypt path. Every method fails.
+pub struct RejectingRootKeys;
+
+impl RootKeyProvider for RejectingRootKeys {
+    fn create_tenant_root(&self, _workspace_id: Uuid) -> Result<String, CryptoError> {
+        Err(CryptoError::DevProviderInProduction)
+    }
+
+    fn encrypt(
+        &self,
+        _key_ref: &str,
+        _plaintext: &[u8],
+        _context: &KekContext,
+    ) -> Result<Vec<u8>, CryptoError> {
+        Err(CryptoError::DevProviderInProduction)
+    }
+
+    fn decrypt(
+        &self,
+        _key_ref: &str,
+        _blob: &[u8],
+        _context: &KekContext,
+    ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        Err(CryptoError::DevProviderInProduction)
+    }
+
+    fn schedule_destruction(
+        &self,
+        _key_ref: &str,
+        _not_before_unix: u64,
+    ) -> Result<(), CryptoError> {
+        Err(CryptoError::DevProviderInProduction)
+    }
+
+    fn cancel_destruction(&self, _key_ref: &str) -> Result<(), CryptoError> {
+        Err(CryptoError::DevProviderInProduction)
+    }
+
+    fn root_key_state(&self, _key_ref: &str) -> Result<RootKeyState, CryptoError> {
+        Err(CryptoError::DevProviderInProduction)
+    }
+
+    fn destroy_if_due(&self, _key_ref: &str, _now_unix: u64) -> Result<bool, CryptoError> {
+        Err(CryptoError::DevProviderInProduction)
+    }
+}
+
 /// Counts `decrypt` calls. Used to prove a denied request never unwraps a key.
 pub struct CountingProvider<P> {
     inner: P,
