@@ -4,6 +4,7 @@
 .credentials-dev-keys.tmp
 .credentials-dev-signer.json
 .credentials-dev-signer.tmp
+.credentials-dev-anchor.log
 .credentials-dev.sqlite
 .credentials-dev.sqlite-wal
 .credentials-dev.sqlite-shm

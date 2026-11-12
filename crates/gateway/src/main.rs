@@ -15,7 +15,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use credentials_crypto::{DevFileRootKeys, DevPolicy};
-use credentials_gateway::{serve, Clock, DevSigner, Gateway, SqlStore, UnconfiguredUpstream};
+use credentials_gateway::{
+    serve, Clock, DevFileAnchor, DevSigner, Gateway, SqlStore, UnconfiguredUpstream,
+};
 
 #[tokio::main]
 async fn main() {
@@ -64,12 +66,22 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let gateway = match Gateway::with_signer(
+    let anchor_path = std::env::var("CREDENTIALS_DEV_ANCHOR")
+        .unwrap_or_else(|_| ".credentials-dev-anchor.log".into());
+    let anchor = match DevFileAnchor::open(&anchor_path, policy) {
+        Ok(anchor) => Arc::new(anchor),
+        Err(err) => {
+            eprintln!("dev audit anchor: {err}");
+            std::process::exit(1);
+        }
+    };
+    let gateway = match Gateway::with_anchor(
         store,
         kms,
         Arc::new(UnconfiguredUpstream),
         Arc::new(Clock),
         signer,
+        anchor,
     ) {
         Ok(gateway) => Arc::new(gateway),
         Err(err) => {
@@ -91,6 +103,9 @@ async fn main() {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
+            if let Err(err) = poller.publish_checkpoints().await {
+                tracing::error!(error = %err, "audit checkpoint failed");
+            }
             if let Err(err) = poller.poll_shreds().await {
                 tracing::error!(error = %err, "shred poller failed");
             }

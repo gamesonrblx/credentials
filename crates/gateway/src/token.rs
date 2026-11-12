@@ -135,6 +135,20 @@ impl DevSigner {
         }
     }
 
+    pub fn sign_message(&self, message: &[u8]) -> Vec<u8> {
+        self.signing.sign(message).to_bytes().to_vec()
+    }
+
+    pub fn verify_message(&self, message: &[u8], signature: &[u8]) -> bool {
+        let Ok(bytes) = <[u8; 64]>::try_from(signature) else {
+            return false;
+        };
+        self.signing
+            .verifying_key()
+            .verify(message, &Signature::from_bytes(&bytes))
+            .is_ok()
+    }
+
     pub fn sign(&self, iss: &str, claims: &AgentClaims) -> Result<String, ApiError> {
         if claims.exp <= claims.iat || claims.exp - claims.iat > MAX_TTL_SECS {
             return Err(ApiError::BadRequest);

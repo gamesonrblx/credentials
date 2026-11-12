@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+mod anchor;
 mod audit;
 mod b64;
 mod dpop;
@@ -26,6 +27,7 @@ mod store;
 mod token;
 mod upstream;
 
+pub use anchor::{checkpoint_message, AuditAnchor, DevFileAnchor, MemoryAnchor};
 pub use audit::{verify_chain, AuditRecord};
 pub use error::ApiError;
 pub use http::router;

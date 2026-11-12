@@ -167,6 +167,22 @@ pub trait Store: Send + Sync {
     ) -> Result<(), ApiError>;
     async fn delete_secret_material(&self, workspace_id: Uuid) -> Result<(), ApiError>;
     async fn workspaces_with_status(&self, status: &str) -> Result<Vec<WorkspaceRow>, ApiError>;
+    async fn audit_tip(&self, workspace_id: Uuid) -> Result<Option<(u64, [u8; 32])>, ApiError>;
+    async fn insert_checkpoint(&self, row: CheckpointRow) -> Result<(), ApiError>;
+    async fn latest_checkpoint(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Option<CheckpointRow>, ApiError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct CheckpointRow {
+    pub workspace_id: Uuid,
+    pub seq: u64,
+    pub tip_hash: [u8; 32],
+    pub kid: String,
+    pub signature: Vec<u8>,
+    pub anchored_at: Option<u64>,
 }
 
 #[derive(Default)]
@@ -179,6 +195,7 @@ struct State {
     agents: HashMap<Uuid, AgentRow>,
     sessions: HashMap<Uuid, SessionRow>,
     audits: Vec<AuditRecord>,
+    checkpoints: Vec<CheckpointRow>,
     tips: HashMap<Uuid, [u8; 32]>,
     agent_tips: HashMap<(Uuid, Uuid), ([u8; 32], u64)>,
 }
@@ -520,6 +537,35 @@ impl Store for MemoryStore {
             .filter(|row| row.status == status)
             .cloned()
             .collect())
+    }
+
+    async fn audit_tip(&self, workspace_id: Uuid) -> Result<Option<(u64, [u8; 32])>, ApiError> {
+        let state = lock(&self.inner);
+        let Some(workspace) = state.workspaces.get(&workspace_id) else {
+            return Ok(None);
+        };
+        if workspace.audit_seq == 0 {
+            return Ok(None);
+        }
+        let hash = state.tips.get(&workspace_id).copied().unwrap_or([0u8; 32]);
+        Ok(Some((workspace.audit_seq, hash)))
+    }
+
+    async fn insert_checkpoint(&self, row: CheckpointRow) -> Result<(), ApiError> {
+        lock(&self.inner).checkpoints.push(row);
+        Ok(())
+    }
+
+    async fn latest_checkpoint(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Option<CheckpointRow>, ApiError> {
+        Ok(lock(&self.inner)
+            .checkpoints
+            .iter()
+            .rev()
+            .find(|row| row.workspace_id == workspace_id)
+            .cloned())
     }
 }
 

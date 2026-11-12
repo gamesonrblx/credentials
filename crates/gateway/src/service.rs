@@ -16,6 +16,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing as ZeroizingBuf;
 
+use crate::anchor::{
+    checkpoint_message, AuditAnchor, MemoryAnchor, AUDIT_ANCHOR_MAX_LAG, CHECKPOINT_EVERY_EVENTS,
+    CHECKPOINT_EVERY_SECS,
+};
 use crate::audit::{verify_chain, AuditDraft, AuditRecord, AuditValue};
 use crate::dpop::{self, DpopKey};
 use crate::names::valid_secret_name;
@@ -88,14 +92,24 @@ struct CachedKek {
     expires: Instant,
 }
 
+struct AnchorTrack {
+    started_at: u64,
+    last_checkpoint_at: HashMap<Uuid, u64>,
+    failed_since: Option<u64>,
+    max_lag: u64,
+}
+
 pub struct Gateway {
     store: Arc<dyn Store>,
     kms: Arc<dyn RootKeyProvider>,
     upstream: Arc<dyn Upstream>,
+    anchor: Arc<dyn AuditAnchor>,
     signer: DevSigner,
     clock: Arc<dyn Now>,
     kek_cache: Mutex<HashMap<Uuid, CachedKek>>,
+    kek_flight: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
     dpop_seen: Mutex<HashMap<String, u64>>,
+    anchor_track: Mutex<AnchorTrack>,
     pub metrics_integrity: AtomicU64,
 }
 
@@ -161,19 +175,50 @@ impl Gateway {
         clock: Arc<dyn Now>,
         signer: DevSigner,
     ) -> Result<Self, ApiError> {
+        Self::with_anchor(
+            store,
+            kms,
+            upstream,
+            clock,
+            signer,
+            Arc::new(MemoryAnchor::new()),
+        )
+    }
+
+    pub fn with_anchor(
+        store: Arc<dyn Store>,
+        kms: Arc<dyn RootKeyProvider>,
+        upstream: Arc<dyn Upstream>,
+        clock: Arc<dyn Now>,
+        signer: DevSigner,
+        anchor: Arc<dyn AuditAnchor>,
+    ) -> Result<Self, ApiError> {
         if !DevPolicy::from_env().allow_dev {
             return Err(ApiError::KmsUnavailable);
         }
+        let started_at = clock.unix_secs();
         Ok(Self {
             store,
             kms,
             upstream,
+            anchor,
             signer,
             clock,
             kek_cache: Mutex::new(HashMap::new()),
+            kek_flight: Mutex::new(HashMap::new()),
             dpop_seen: Mutex::new(HashMap::new()),
+            anchor_track: Mutex::new(AnchorTrack {
+                started_at,
+                last_checkpoint_at: HashMap::new(),
+                failed_since: None,
+                max_lag: AUDIT_ANCHOR_MAX_LAG,
+            }),
             metrics_integrity: AtomicU64::new(0),
         })
+    }
+
+    pub fn set_anchor_max_lag(&self, secs: u64) {
+        self.anchor_track.lock().expect("anchor lock").max_lag = secs;
     }
 
     pub async fn create_workspace(&self) -> Result<CreatedWorkspace, ApiError> {
@@ -582,6 +627,7 @@ impl Gateway {
             access_fields(&secret, None, request.delivery, host.as_deref()),
         )
         .await?;
+        self.ensure_anchor_fresh(workspace.id).await?;
 
         let version = self.store.latest_version(secret.id).await?;
         if version.wrap_mode != WrapMode::Gateway || version.e2e_encapsulation.is_some() {
@@ -984,15 +1030,134 @@ impl Gateway {
         }
     }
 
+    /// Sign the current audit tip when 1,000 events or 60 seconds have passed.
+    pub async fn publish_checkpoints(&self) -> Result<u32, ApiError> {
+        self.publish_all(false).await
+    }
+
+    /// Sign every workspace tip, including ones inside the 60-second window.
+    pub async fn shutdown(&self) -> Result<u32, ApiError> {
+        self.publish_all(true).await
+    }
+
+    async fn publish_all(&self, force: bool) -> Result<u32, ApiError> {
+        let mut count = 0u32;
+        for status in ["active", "deleting", "shredded"] {
+            for workspace in self.store.workspaces_with_status(status).await? {
+                if self.publish_one(workspace.id, force).await? {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    async fn ensure_anchor_fresh(&self, workspace_id: Uuid) -> Result<(), ApiError> {
+        let _ = self.publish_one(workspace_id, false).await?;
+        let now = self.clock.unix_secs();
+        let track = self.anchor_track.lock().expect("anchor lock");
+        if let Some(since) = track.failed_since {
+            if now.saturating_sub(since) > track.max_lag {
+                return Err(ApiError::AuditAnchorUnavailable);
+            }
+        }
+        Ok(())
+    }
+
+    async fn publish_one(&self, workspace_id: Uuid, force: bool) -> Result<bool, ApiError> {
+        let Some((seq, tip_hash)) = self.store.audit_tip(workspace_id).await? else {
+            return Ok(false);
+        };
+        let previous = self.store.latest_checkpoint(workspace_id).await?;
+        if previous
+            .as_ref()
+            .is_some_and(|row| row.seq == seq && row.anchored_at.is_some())
+        {
+            return Ok(false);
+        }
+        let now = self.clock.unix_secs();
+        let due = {
+            let track = self.anchor_track.lock().expect("anchor lock");
+            let last = track
+                .last_checkpoint_at
+                .get(&workspace_id)
+                .copied()
+                .unwrap_or(track.started_at);
+            let gap = seq.saturating_sub(previous.as_ref().map(|row| row.seq).unwrap_or(0));
+            force
+                || gap >= CHECKPOINT_EVERY_EVENTS
+                || now.saturating_sub(last) >= CHECKPOINT_EVERY_SECS
+        };
+        if !due {
+            return Ok(false);
+        }
+        let message = checkpoint_message(workspace_id, seq, &tip_hash);
+        let signature = self.signer.sign_message(&message);
+        match self
+            .anchor
+            .put(workspace_id, seq, &tip_hash, &signature)
+            .await
+        {
+            Ok(()) => {
+                self.store
+                    .insert_checkpoint(crate::store::CheckpointRow {
+                        workspace_id,
+                        seq,
+                        tip_hash,
+                        kid: self.signer.kid.clone(),
+                        signature,
+                        anchored_at: Some(now),
+                    })
+                    .await?;
+                let mut track = self.anchor_track.lock().expect("anchor lock");
+                track.last_checkpoint_at.insert(workspace_id, now);
+                track.failed_since = None;
+                Ok(true)
+            }
+            Err(_) => {
+                let mut track = self.anchor_track.lock().expect("anchor lock");
+                if track.failed_since.is_none() {
+                    track.failed_since = Some(now);
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    fn cached_kek(&self, workspace: &WorkspaceRow, kek_id: Uuid) -> Option<ZeroizingBuf<[u8; 32]>> {
+        let cache = self.kek_cache.lock().expect("cache lock");
+        let hit = cache.get(&kek_id)?;
+        if hit.expires > Instant::now()
+            && hit.workspace_id == workspace.id
+            && workspace.status == "active"
+        {
+            Some(hit.key.clone())
+        } else {
+            None
+        }
+    }
+
     fn unwrap_kek(
         &self,
         workspace: &WorkspaceRow,
         kek: &KekRow,
     ) -> Result<ZeroizingBuf<[u8; 32]>, ApiError> {
-        if let Some(hit) = self.kek_cache.lock().expect("cache lock").get(&kek.id) {
-            if hit.expires > Instant::now() && hit.workspace_id == workspace.id {
-                return Ok(hit.key.clone());
-            }
+        if workspace.status != "active" {
+            return Err(ApiError::WorkspaceDeleting);
+        }
+        if let Some(hit) = self.cached_kek(workspace, kek.id) {
+            return Ok(hit);
+        }
+        let gate = {
+            let mut flights = self.kek_flight.lock().expect("cache lock");
+            flights
+                .entry(kek.id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _flight = gate.lock().expect("kek flight");
+        if let Some(hit) = self.cached_kek(workspace, kek.id) {
+            return Ok(hit);
         }
         let context = KekContext {
             workspace_id: workspace.id,

@@ -21,8 +21,8 @@ use uuid::Uuid;
 use crate::audit::{commit_event, AuditDraft, AuditRecord, AuditValue};
 use crate::policy::DeliveryPolicy;
 use crate::store::{
-    ensure_gateway, AgentRow, KekRow, SecretRow, SessionRow, Store, VersionRow, WorkspaceRow,
-    WrapMode,
+    ensure_gateway, AgentRow, CheckpointRow, KekRow, SecretRow, SessionRow, Store, VersionRow,
+    WorkspaceRow, WrapMode,
 };
 use crate::ApiError;
 
@@ -885,6 +885,75 @@ impl Store for SqlStore {
                 .map_err(map_db)?;
             rows.iter().map(|row| workspace_from!(row)).collect()
         })
+    }
+
+    async fn audit_tip(&self, workspace_id: Uuid) -> Result<Option<(u64, [u8; 32])>, ApiError> {
+        on_pool!(
+            self,
+            "SELECT seq, hash FROM audit_events WHERE workspace_id = ? ORDER BY seq DESC LIMIT 1",
+            |db, q| {
+                let row = sqlx::query(q)
+                    .bind(workspace_id)
+                    .fetch_optional(db)
+                    .await
+                    .map_err(map_db)?;
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let seq = u64_from(row.try_get("seq").map_err(map_db)?)?;
+                let hash = arr32(row.try_get::<Vec<u8>, _>("hash").map_err(map_db)?)?;
+                Ok(Some((seq, hash)))
+            }
+        )
+    }
+
+    async fn insert_checkpoint(&self, row: CheckpointRow) -> Result<(), ApiError> {
+        on_pool!(
+            self,
+            "INSERT INTO audit_checkpoints (workspace_id, seq, tip_hash, kid, signature, anchored_at) VALUES (?, ?, ?, ?, ?, ?)",
+            |db, q| {
+                sqlx::query(q)
+                    .bind(row.workspace_id)
+                    .bind(i64_from(row.seq)?)
+                    .bind(row.tip_hash.as_slice())
+                    .bind(&row.kid)
+                    .bind(row.signature.as_slice())
+                    .bind(row.anchored_at.map(i64_from).transpose()?)
+                    .execute(db)
+                    .await
+                    .map_err(map_db)?;
+            }
+        );
+        Ok(())
+    }
+
+    async fn latest_checkpoint(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Option<CheckpointRow>, ApiError> {
+        on_pool!(
+            self,
+            "SELECT workspace_id, seq, tip_hash, kid, signature, anchored_at FROM audit_checkpoints WHERE workspace_id = ? ORDER BY seq DESC LIMIT 1",
+            |db, q| {
+                let row = sqlx::query(q)
+                    .bind(workspace_id)
+                    .fetch_optional(db)
+                    .await
+                    .map_err(map_db)?;
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let anchored: Option<i64> = row.try_get("anchored_at").map_err(map_db)?;
+                Ok(Some(CheckpointRow {
+                    workspace_id: row.try_get("workspace_id").map_err(map_db)?,
+                    seq: u64_from(row.try_get("seq").map_err(map_db)?)?,
+                    tip_hash: arr32(row.try_get::<Vec<u8>, _>("tip_hash").map_err(map_db)?)?,
+                    kid: row.try_get("kid").map_err(map_db)?,
+                    signature: row.try_get("signature").map_err(map_db)?,
+                    anchored_at: anchored.map(u64_from).transpose()?,
+                }))
+            }
+        )
     }
 }
 
