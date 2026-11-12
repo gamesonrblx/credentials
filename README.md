@@ -24,6 +24,7 @@
 - [Getting started](#getting-started)
 - [Usage](#usage)
 - [Roadmap](#roadmap)
+- [Handoff](docs/HANDOFF.md)
 - [Contributing](#contributing)
 - [License](#license)
 - [Contact](#contact)
@@ -82,14 +83,14 @@ Read [docs/API.md](docs/API.md) for the routes. Read [docs/INTEGRATION.md](docs/
 
 ## Roadmap
 
-The ordered plan is [docs/ROADMAP.md](docs/ROADMAP.md).
+The ordered plan is [docs/ROADMAP.md](docs/ROADMAP.md). The current state is [docs/HANDOFF.md](docs/HANDOFF.md).
 
 - M1 stores rows in SQLite and Postgres.
 - M2 publishes the HTTP API and the local socket.
 - M3 seals end-to-end secrets. The control plane does not open them.
 - M4 starts a production control plane and TLS group 4588.
 - M5 describes the hosted control plane. No hosted service is live.
-- M6 seals a dotenv import in the injector. Human SSO is a design, not a full login.
+- M6 seals a dotenv import in the injector. The dashboard signs in with OIDC and does not decrypt.
 
 ## Contributing
 
