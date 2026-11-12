@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use credentials_crypto::{
     open_secret, random_bytes, rewrap_dek, seal_secret, DevPolicy, KekContext, OpenSecret,
-    RootKeyProvider, UnwrappedKek, VersionIds, DEFAULT_MAX_SECRET_BYTES,
+    RootKeyProvider, RootKeyState, UnwrappedKek, VersionIds, DEFAULT_MAX_SECRET_BYTES,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -749,23 +749,120 @@ impl Gateway {
         if confirm != workspace.id {
             return Err(ApiError::BadRequest);
         }
+        if workspace.status != "active" {
+            return Err(ApiError::WorkspaceDeleting);
+        }
+        let now = self.clock.unix_secs();
         self.store
             .set_workspace_status(workspace.id, "deleting")
             .await?;
+        self.store
+            .revoke_workspace_sessions(workspace.id, now)
+            .await?;
+        self.drop_workspace_keks(workspace.id);
         self.kms
-            .schedule_destruction(
-                &workspace.kms_key_ref,
-                self.clock.unix_secs() + 7 * 24 * 3600,
-            )
+            .schedule_destruction(&workspace.kms_key_ref, now + 7 * 24 * 3600)
             .map_err(map_crypto)?;
-        self.kek_cache
-            .lock()
-            .expect("cache lock")
-            .retain(|_, entry| entry.workspace_id != workspace.id);
         self.store
             .append_audit(self.audit(workspace.id, None, "tenant.delete.scheduled", Vec::new()))
             .await?;
+        self.store.delete_secret_material(workspace.id).await?;
         Ok(())
+    }
+
+    /// Allowed only while the root key is still pending destruction.
+    /// Rows removed at schedule time stay removed. A fresh KEK is minted
+    /// when none is active, so the workspace can store new secrets.
+    pub async fn cancel_deletion(&self, credential: &str, id: Uuid) -> Result<(), ApiError> {
+        let workspace = self.authenticate_workspace(credential).await?;
+        if workspace.id != id {
+            return Err(ApiError::NotFound);
+        }
+        if workspace.status != "deleting" {
+            return Err(ApiError::BadRequest);
+        }
+        let state = self
+            .kms
+            .root_key_state(&workspace.kms_key_ref)
+            .map_err(map_crypto)?;
+        let RootKeyState::Pending { not_before_unix } = state else {
+            return Err(ApiError::BadRequest);
+        };
+        if self.clock.unix_secs() >= not_before_unix {
+            return Err(ApiError::BadRequest);
+        }
+        self.kms
+            .cancel_destruction(&workspace.kms_key_ref)
+            .map_err(map_crypto)?;
+        self.store
+            .set_workspace_status(workspace.id, "active")
+            .await?;
+        if self.store.active_kek(workspace.id).await.is_err() {
+            self.mint_kek(&workspace).await?;
+        }
+        self.store
+            .append_audit(self.audit(workspace.id, None, "tenant.delete.cancelled", Vec::new()))
+            .await?;
+        Ok(())
+    }
+
+    /// Sets `shredded` once the root key waiting period has elapsed.
+    pub async fn poll_shreds(&self) -> Result<u32, ApiError> {
+        let now = self.clock.unix_secs();
+        let mut count = 0u32;
+        for workspace in self.store.workspaces_with_status("deleting").await? {
+            let due = self
+                .kms
+                .destroy_if_due(&workspace.kms_key_ref, now)
+                .map_err(map_crypto)?;
+            if !due {
+                continue;
+            }
+            self.store
+                .revoke_workspace_credentials(workspace.id, now)
+                .await?;
+            self.store
+                .set_workspace_status(workspace.id, "shredded")
+                .await?;
+            self.drop_workspace_keks(workspace.id);
+            self.store
+                .append_audit(self.audit(workspace.id, None, "tenant.shredded", Vec::new()))
+                .await?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn mint_kek(&self, workspace: &WorkspaceRow) -> Result<(), ApiError> {
+        let version = self.store.next_kek_version(workspace.id).await?;
+        let kek_id = Uuid::now_v7();
+        let raw = ZeroizingBuf::new(random_32()?);
+        let context = KekContext {
+            workspace_id: workspace.id,
+            kek_id,
+            kek_version: version,
+        };
+        let wrapped = self
+            .kms
+            .encrypt(&workspace.kms_key_ref, raw.as_slice(), &context)
+            .map_err(map_crypto)?;
+        self.store
+            .insert_kek(KekRow {
+                id: kek_id,
+                workspace_id: workspace.id,
+                version,
+                status: "active".to_owned(),
+                wrapped_kek: wrapped,
+                kms_key_ref: workspace.kms_key_ref.clone(),
+            })
+            .await
+    }
+
+    fn drop_workspace_keks(&self, workspace_id: Uuid) {
+        self.kek_cache
+            .lock()
+            .expect("cache lock")
+            .retain(|_, entry| entry.workspace_id != workspace_id);
     }
 
     pub async fn audit_log(

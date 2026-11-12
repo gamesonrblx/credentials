@@ -34,6 +34,7 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route("/v1/audit", get(audit))
         .route("/v1/kek/rotate", post(rotate_kek))
         .route("/v1/workspaces/{id}/deletion", post(delete_workspace))
+        .route("/v1/workspaces/{id}/deletion/cancel", post(cancel_deletion))
         .with_state(AppState { gateway })
 }
 
@@ -330,6 +331,15 @@ async fn rotate_kek(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let version = state.gateway.rotate_kek(bearer(&headers)?).await?;
     Ok(Json(serde_json::json!({ "kek_version": version })))
+}
+
+async fn cancel_deletion(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    state.gateway.cancel_deletion(bearer(&headers)?, id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_workspace(

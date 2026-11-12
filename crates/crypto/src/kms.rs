@@ -62,6 +62,19 @@ pub trait RootKeyProvider: Send + Sync {
     ) -> Result<Zeroizing<Vec<u8>>, CryptoError>;
     fn schedule_destruction(&self, key_ref: &str, not_before_unix: u64) -> Result<(), CryptoError>;
     fn cancel_destruction(&self, key_ref: &str) -> Result<(), CryptoError>;
+    fn root_key_state(&self, key_ref: &str) -> Result<RootKeyState, CryptoError>;
+    /// When `now_unix` is at or past a pending destruction time, the key becomes
+    /// destroyed and later cancel calls fail.
+    fn destroy_if_due(&self, key_ref: &str, now_unix: u64) -> Result<bool, CryptoError>;
+}
+
+/// What the provider reports for a tenant root. The gateway compares
+/// `not_before_unix` with its own clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootKeyState {
+    Active,
+    Pending { not_before_unix: u64 },
+    Destroyed,
 }
 
 /// How the process decides whether a dev provider may exist.
@@ -95,6 +108,7 @@ impl DevPolicy {
 enum KeyLife {
     Active,
     Pending { not_before_unix: u64 },
+    Destroyed,
 }
 
 struct TenantRoot {
@@ -166,8 +180,36 @@ impl RootKeyProvider for MemoryRootKeys {
         let root = keys
             .get_mut(key_ref)
             .ok_or(CryptoError::RootKeyUnavailable)?;
+        if matches!(root.life, KeyLife::Destroyed) {
+            return Err(CryptoError::RootKeyUnavailable);
+        }
         root.life = KeyLife::Active;
         Ok(())
+    }
+
+    fn root_key_state(&self, key_ref: &str) -> Result<RootKeyState, CryptoError> {
+        let keys = self.keys.lock().expect("memory root lock");
+        let root = keys.get(key_ref).ok_or(CryptoError::RootKeyUnavailable)?;
+        Ok(match root.life {
+            KeyLife::Active => RootKeyState::Active,
+            KeyLife::Pending { not_before_unix } => RootKeyState::Pending { not_before_unix },
+            KeyLife::Destroyed => RootKeyState::Destroyed,
+        })
+    }
+
+    fn destroy_if_due(&self, key_ref: &str, now_unix: u64) -> Result<bool, CryptoError> {
+        let mut keys = self.keys.lock().expect("memory root lock");
+        let root = keys
+            .get_mut(key_ref)
+            .ok_or(CryptoError::RootKeyUnavailable)?;
+        match root.life {
+            KeyLife::Destroyed => Ok(true),
+            KeyLife::Pending { not_before_unix } if now_unix >= not_before_unix => {
+                root.life = KeyLife::Destroyed;
+                Ok(true)
+            }
+            KeyLife::Pending { .. } | KeyLife::Active => Ok(false),
+        }
     }
 }
 
@@ -266,6 +308,43 @@ impl RootKeyProvider for DevFileRootKeys {
         key.not_before_unix = None;
         write_file(&self.path, &store)
     }
+
+    fn root_key_state(&self, key_ref: &str) -> Result<RootKeyState, CryptoError> {
+        let _guard = self.inner.lock().expect("dev file lock");
+        let store = read_file(&self.path)?;
+        let key = store
+            .keys
+            .get(key_ref)
+            .ok_or(CryptoError::RootKeyUnavailable)?;
+        Ok(match key.state.as_str() {
+            "active" => RootKeyState::Active,
+            "pending" => RootKeyState::Pending {
+                not_before_unix: key.not_before_unix.unwrap_or(0),
+            },
+            "destroyed" => RootKeyState::Destroyed,
+            _ => return Err(CryptoError::CorruptStore),
+        })
+    }
+
+    fn destroy_if_due(&self, key_ref: &str, now_unix: u64) -> Result<bool, CryptoError> {
+        let _guard = self.inner.lock().expect("dev file lock");
+        let mut store = read_file(&self.path)?;
+        let key = store
+            .keys
+            .get_mut(key_ref)
+            .ok_or(CryptoError::RootKeyUnavailable)?;
+        let due = match key.state.as_str() {
+            "destroyed" => true,
+            "pending" => now_unix >= key.not_before_unix.unwrap_or(0),
+            "active" => false,
+            _ => return Err(CryptoError::CorruptStore),
+        };
+        if due {
+            key.state = "destroyed".to_owned();
+            write_file(&self.path, &store)?;
+        }
+        Ok(due)
+    }
 }
 
 /// Counts `decrypt` calls. Used to prove a denied request never unwraps a key.
@@ -318,6 +397,14 @@ impl<P: RootKeyProvider> RootKeyProvider for CountingProvider<P> {
     fn cancel_destruction(&self, key_ref: &str) -> Result<(), CryptoError> {
         self.inner.cancel_destruction(key_ref)
     }
+
+    fn root_key_state(&self, key_ref: &str) -> Result<RootKeyState, CryptoError> {
+        self.inner.root_key_state(key_ref)
+    }
+
+    fn destroy_if_due(&self, key_ref: &str, now_unix: u64) -> Result<bool, CryptoError> {
+        self.inner.destroy_if_due(key_ref, now_unix)
+    }
 }
 
 fn usable_root(root: Option<&TenantRoot>, now: u64) -> Result<&[u8; 32], CryptoError> {
@@ -325,7 +412,7 @@ fn usable_root(root: Option<&TenantRoot>, now: u64) -> Result<&[u8; 32], CryptoE
     match root.life {
         KeyLife::Active => Ok(&root.key),
         KeyLife::Pending { not_before_unix } if now < not_before_unix => Ok(&root.key),
-        KeyLife::Pending { .. } => Err(CryptoError::RootKeyUnavailable),
+        KeyLife::Pending { .. } | KeyLife::Destroyed => Err(CryptoError::RootKeyUnavailable),
     }
 }
 

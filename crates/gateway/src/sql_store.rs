@@ -815,6 +815,77 @@ impl Store for SqlStore {
             }
         )
     }
+
+    async fn revoke_workspace_sessions(&self, workspace_id: Uuid, at: u64) -> Result<(), ApiError> {
+        on_pool!(
+            self,
+            "UPDATE agent_sessions SET revoked_at = ? WHERE workspace_id = ? AND revoked_at IS NULL",
+            |db, q| {
+                sqlx::query(q)
+                    .bind(i64_from(at)?)
+                    .bind(workspace_id)
+                    .execute(db)
+                    .await
+                    .map_err(map_db)?;
+            }
+        );
+        Ok(())
+    }
+
+    async fn revoke_workspace_credentials(
+        &self,
+        workspace_id: Uuid,
+        at: u64,
+    ) -> Result<(), ApiError> {
+        on_pool!(
+            self,
+            "UPDATE workspace_credentials SET revoked_at = ? WHERE workspace_id = ? AND revoked_at IS NULL",
+            |db, q| {
+                sqlx::query(q)
+                    .bind(i64_from(at)?)
+                    .bind(workspace_id)
+                    .execute(db)
+                    .await
+                    .map_err(map_db)?;
+            }
+        );
+        Ok(())
+    }
+
+    async fn delete_secret_material(&self, workspace_id: Uuid) -> Result<(), ApiError> {
+        let mut tx = self.begin().await?;
+        for sql in [
+            "DELETE FROM secret_versions WHERE workspace_id = ?",
+            "DELETE FROM secret_delivery_policies WHERE secret_id IN (SELECT id FROM secrets WHERE workspace_id = ?)",
+            "DELETE FROM secrets WHERE workspace_id = ?",
+            "DELETE FROM kek_versions WHERE workspace_id = ?",
+        ] {
+            on_tx!(&mut tx, sql, |db, q| {
+                sqlx::query(q)
+                    .bind(workspace_id)
+                    .execute(&mut **db)
+                    .await
+                    .map_err(map_db)?;
+            });
+        }
+        commit(tx).await
+    }
+
+    async fn workspaces_with_status(&self, status: &str) -> Result<Vec<WorkspaceRow>, ApiError> {
+        let sql = "SELECT w.id, w.status, w.kms_key_ref, w.audit_seq, \
+                   (SELECT c.secret_hash FROM workspace_credentials c \
+                    WHERE c.workspace_id = w.id AND c.revoked_at IS NULL \
+                    ORDER BY c.created_at LIMIT 1) AS credential_hash \
+                   FROM workspaces w WHERE w.status = ?";
+        on_pool!(self, sql, |db, q| {
+            let rows = sqlx::query(q)
+                .bind(status)
+                .fetch_all(db)
+                .await
+                .map_err(map_db)?;
+            rows.iter().map(|row| workspace_from!(row)).collect()
+        })
+    }
 }
 
 const VERSION_COLS: &str = "SELECT id, secret_id, workspace_id, version, payload_alg, payload_nonce, payload_ciphertext, dek_wrap_alg, dek_wrap_nonce, dek_wrapped, kek_id, wrap_mode, e2e_encapsulation, plaintext_len FROM secret_versions";

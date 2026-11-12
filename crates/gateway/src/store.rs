@@ -159,6 +159,14 @@ pub trait Store: Send + Sync {
         workspace_id: Uuid,
         agent_id: Uuid,
     ) -> Result<Vec<AuditRecord>, ApiError>;
+    async fn revoke_workspace_sessions(&self, workspace_id: Uuid, at: u64) -> Result<(), ApiError>;
+    async fn revoke_workspace_credentials(
+        &self,
+        workspace_id: Uuid,
+        at: u64,
+    ) -> Result<(), ApiError>;
+    async fn delete_secret_material(&self, workspace_id: Uuid) -> Result<(), ApiError>;
+    async fn workspaces_with_status(&self, status: &str) -> Result<Vec<WorkspaceRow>, ApiError>;
 }
 
 #[derive(Default)]
@@ -455,6 +463,61 @@ impl Store for MemoryStore {
             .audits
             .iter()
             .filter(|event| event.workspace_id == workspace_id && event.agent_id == Some(agent_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn revoke_workspace_sessions(&self, workspace_id: Uuid, at: u64) -> Result<(), ApiError> {
+        let mut state = lock(&self.inner);
+        for session in state.sessions.values_mut() {
+            if session.workspace_id == workspace_id && session.revoked_at.is_none() {
+                session.revoked_at = Some(at);
+            }
+        }
+        Ok(())
+    }
+
+    async fn revoke_workspace_credentials(
+        &self,
+        workspace_id: Uuid,
+        _at: u64,
+    ) -> Result<(), ApiError> {
+        let mut state = lock(&self.inner);
+        let hashes: Vec<[u8; 32]> = state
+            .by_hash
+            .iter()
+            .filter(|(_, id)| **id == workspace_id)
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in hashes {
+            state.by_hash.remove(&hash);
+        }
+        Ok(())
+    }
+
+    async fn delete_secret_material(&self, workspace_id: Uuid) -> Result<(), ApiError> {
+        let mut state = lock(&self.inner);
+        let secret_ids: Vec<Uuid> = state
+            .secrets
+            .values()
+            .filter(|secret| secret.workspace_id == workspace_id)
+            .map(|secret| secret.id)
+            .collect();
+        state
+            .versions
+            .retain(|_, version| version.workspace_id != workspace_id);
+        for id in &secret_ids {
+            state.secrets.remove(id);
+        }
+        state.keks.retain(|_, kek| kek.workspace_id != workspace_id);
+        Ok(())
+    }
+
+    async fn workspaces_with_status(&self, status: &str) -> Result<Vec<WorkspaceRow>, ApiError> {
+        Ok(lock(&self.inner)
+            .workspaces
+            .values()
+            .filter(|row| row.status == status)
             .cloned()
             .collect())
     }

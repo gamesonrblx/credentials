@@ -28,5 +28,6 @@ pub use error::CryptoError;
 pub use hybrid::{generate_hybrid_keypair, unwrap_key, wrap_key, HybridKeyPair, HybridWrapped};
 pub use kms::{
     CountingProvider, DevFileRootKeys, DevPolicy, KekContext, MemoryRootKeys, RootKeyProvider,
+    RootKeyState,
 };
 pub use random::random_bytes;

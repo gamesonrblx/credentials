@@ -86,6 +86,17 @@ async fn main() {
             std::process::exit(1);
         });
 
+    let poller = Arc::clone(&gateway);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if let Err(err) = poller.poll_shreds().await {
+                tracing::error!(error = %err, "shred poller failed");
+            }
+        }
+    });
+
     if let Err(err) = serve(gateway, addr).await {
         eprintln!("server: {err}");
         std::process::exit(1);

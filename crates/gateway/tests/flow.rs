@@ -399,6 +399,62 @@ async fn rotation_and_deletion() {
     assert_eq!(env.kms.decrypts(), decrypts);
 }
 
+#[tokio::test]
+async fn cancel_restores_a_workspace_and_shred_is_terminal() {
+    let env = setup().await;
+    env.gateway
+        .create_secret(
+            &env.credential,
+            "prod/openai/api_key",
+            b"before-delete",
+            policy(),
+        )
+        .await
+        .unwrap();
+    env.gateway
+        .delete_workspace(&env.credential, env.workspace)
+        .await
+        .unwrap();
+    assert_eq!(env.gateway.poll_shreds().await.unwrap(), 0);
+    env.gateway
+        .cancel_deletion(&env.credential, env.workspace)
+        .await
+        .unwrap();
+    env.gateway
+        .create_secret(
+            &env.credential,
+            "prod/openai/api_key",
+            b"after-cancel",
+            policy(),
+        )
+        .await
+        .unwrap();
+    env.gateway
+        .delete_workspace(&env.credential, env.workspace)
+        .await
+        .unwrap();
+    let decrypts = env.kms.decrypts();
+    env.clock.set(env.clock.unix_secs() + 8 * 24 * 3600);
+    assert_eq!(env.gateway.poll_shreds().await.unwrap(), 1);
+    let err = env
+        .gateway
+        .cancel_deletion(&env.credential, env.workspace)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "unauthenticated");
+    assert_eq!(env.kms.decrypts(), decrypts);
+    let events = Store::audit_for_workspace(env.store.as_ref(), env.workspace)
+        .await
+        .unwrap();
+    assert!(verify_chain(&events));
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "tenant.delete.cancelled"));
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "tenant.shredded"));
+}
+
 fn request_with_body(token: &str, proof: &str, htu: &str) -> InjectRequest {
     let mut request = request(token, proof, htu);
     request.body = b"{}".to_vec();
