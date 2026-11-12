@@ -26,6 +26,13 @@ pub async fn serve_local(gateway: Arc<Gateway>, directory: PathBuf) -> std::io::
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
     let path = socket_path(&directory);
+    // macOS sockaddr_un paths must be shorter than 104 bytes.
+    if path.as_os_str().len() >= 100 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "local socket path is too long",
+        ));
+    }
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
@@ -105,7 +112,11 @@ mod tests {
 
     #[tokio::test]
     async fn same_user_socket_returns_env_object() {
-        let dir = std::env::temp_dir().join(format!("credentials-local-{}", uuid::Uuid::now_v7()));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::path::PathBuf::from(format!("/tmp/c{:x}", nanos % 0xffff_ffff));
         let gateway = Arc::new(
             Gateway::new(
                 Arc::new(MemoryStore::new()),
